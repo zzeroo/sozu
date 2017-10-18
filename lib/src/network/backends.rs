@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use rand::random;
 use mio::net::TcpStream;
 
-use sozu_command::messages::Instance;
-
+use sozu_command::messages::{Instance,BackendProtocol};
 use network::{AppId,Backend,ConnectionError};
+use network::socket::BackendSocket;
 
 pub struct BackendMap {
   pub instances:    HashMap<AppId, BackendList>,
@@ -54,7 +54,7 @@ impl BackendMap {
     }).unwrap_or(false)
   }
 
-  pub fn backend_from_app_id(&mut self, app_id: &str) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
+  pub fn backend_from_app_id(&mut self, app_id: &str, protocol: BackendProtocol) -> Result<(Rc<RefCell<Backend>>,BackendSocket),ConnectionError> {
     if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
       if app_instances.instances.len() == 0 {
         return Err(ConnectionError::NoBackendAvailable);
@@ -63,9 +63,8 @@ impl BackendMap {
       for _ in 0..self.max_failures {
         if let Some(ref mut b) = app_instances.next_available_instance() {
           let ref mut backend = *b.borrow_mut();
-
           debug!("Connecting {} -> {:?}", app_id, (backend.address, backend.active_connections, backend.failures));
-          let conn = backend.try_connect();
+          let conn = backend.try_connect(protocol);
           if backend.failures >= MAX_FAILURES_PER_BACKEND {
             error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
           }
@@ -85,13 +84,16 @@ impl BackendMap {
     }
   }
 
-  pub fn backend_from_sticky_session(&mut self, app_id: &str, sticky_session: u32) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
-    let sticky_conn: Option<Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError>> = self.instances
+  pub fn backend_from_sticky_session(&mut self, app_id: &str, sticky_session: u32, protocol: BackendProtocol)
+    -> Result<(Rc<RefCell<Backend>>,BackendSocket),ConnectionError> {
+
+    let sticky_conn: Option<Result<(Rc<RefCell<Backend>>,BackendSocket),ConnectionError>> = self.instances
       .get_mut(app_id)
       .and_then(|app_instances| app_instances.find_sticky(sticky_session))
       .map(|b| {
         let ref mut backend = *b.borrow_mut();
-        let conn = backend.try_connect();
+        let conn = backend.try_connect(protocol);
+        info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
         if backend.failures >= MAX_FAILURES_PER_BACKEND {
           error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
         }
@@ -107,7 +109,7 @@ impl BackendMap {
       return res;
     } else {
       debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-      return self.backend_from_app_id(app_id);
+      return self.backend_from_app_id(app_id, protocol);
     }
   }
 }

@@ -30,8 +30,8 @@ use nom::IResult;
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
-use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
-  OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,BackendProtocol,
+  HttpsFront,HttpsProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer_queue::BufferQueue;
@@ -769,7 +769,9 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&mut self, client: &mut TlsClient, host: &str, uri: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
+  pub fn backend_from_request(&mut self, client: &mut TlsClient, host: &str, uri: &str, front_should_stick: bool, protocol: BackendProtocol)
+    -> Result<BackendSocket,ConnectionError> {
+
     trace!("looking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
       h
@@ -781,7 +783,7 @@ impl ServerConfiguration {
     if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
       client.http().map(|h| h.set_app_id(app_id.clone()));
 
-      match self.instances.backend_from_app_id(&app_id) {
+      match self.instances.backend_from_app_id(&app_id, protocol) {
         Err(e) => {
           client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
           Err(e)
@@ -803,10 +805,12 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_sticky_session(&mut self, client: &mut TlsClient, app_id: &str, sticky_session: u32) -> Result<TcpStream,ConnectionError> {
+  pub fn backend_from_sticky_session(&mut self, client: &mut TlsClient, app_id: &str, sticky_session: u32, protocol: BackendProtocol)
+    -> Result<BackendSocket,ConnectionError> {
+
     client.http().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.instances.backend_from_sticky_session(app_id, sticky_session) {
+    match self.instances.backend_from_sticky_session(app_id, sticky_session, protocol) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
         client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
@@ -836,7 +840,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         }
       }
     }).and_then(|(frontend_sock, _)| {
-      frontend_sock.set_nodelay(true);
       if let Ok(ssl) = Ssl::new(&self.default_context.context) {
         let c = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
         return Ok((c, false))
@@ -885,7 +888,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     let rl:RRequestLine = try!(unwrap_msg!(client.http()).state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
     if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
 
-      let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
+      let (protocol, front_should_stick) = self.applications.get(&app_id).map(|ref app| {
+        (app.backend_protocol, app.sticky_session)
+      }).unwrap_or((BackendProtocol::TCP, false));
 
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
         if client.instance.as_ref().map(|instance| {
@@ -932,8 +937,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
       let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
       let conn = match (front_should_stick, sticky_session) {
-        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
-        _ => self.backend_from_request(client, &host, &rl.uri, front_should_stick),
+        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session, protocol),
+        _ => self.backend_from_request(client, &host, &rl.uri, front_should_stick, protocol),
       };
 
       match conn {
@@ -968,8 +973,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
             added_res_header: added_res_header,
           });
 
-          socket.set_nodelay(true);
-          client.set_back_socket(BackendSocket::TCP(socket));
+          client.set_back_socket(socket);
 
           if old_app_id == new_app_id {
             Ok(BackendConnectAction::Replace)

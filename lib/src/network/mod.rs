@@ -3,6 +3,7 @@
 use mio;
 use std::fmt;
 use std::net::SocketAddr;
+use openssl::ssl::{SslMethod, SslConnectorBuilder};
 
 pub mod buffer_queue;
 #[macro_use] pub mod metrics;
@@ -24,6 +25,9 @@ pub mod session;
 use mio::Token;
 
 use self::retry::RetryPolicy;
+use self::socket::BackendSocket;
+
+use sozu_command::messages::BackendProtocol;
 
 pub type AppId = String;
 
@@ -219,13 +223,37 @@ impl Backend {
     }
   }
 
-  pub fn try_connect(&mut self) -> Result<mio::tcp::TcpStream, ConnectionError> {
+  pub fn try_connect(&mut self, protocol: BackendProtocol) -> Result<BackendSocket, ConnectionError> {
     if self.status != BackendStatus::Normal {
       return Err(ConnectionError::NoBackendAvailable);
     }
 
     //FIXME: what happens if the connect() call fails with EINPROGRESS?
-    let conn = mio::tcp::TcpStream::connect(&self.address).map_err(|_| ConnectionError::NoBackendAvailable);
+    let mut conn = match protocol {
+      BackendProtocol::TCP => {
+        let mut c = mio::tcp::TcpStream::connect(&self.address)
+          .map_err(|_| ConnectionError::NoBackendAvailable);
+        c.as_mut().map(|conn| conn.set_nodelay(true));
+        c.map(|stream| BackendSocket::TCP(stream))
+      },
+      BackendProtocol::TLS => {
+        let connector = SslConnectorBuilder::new(SslMethod::tls()).map_err(|e| {
+          error!("TLS connection builder error: {:?}", e);
+          ConnectionError::NoBackendAvailable
+        }).map(|builder| builder.build());
+        if let (Ok(c), Ok(stream)) = (connector, mio::tcp::TcpStream::connect(&self.address)) {
+          stream.set_nodelay(true);
+          error!("DEFAULT DOMAIN TEST.COM IS WRONG");
+          c.connect("test.com", stream).map_err(|e| {
+            error!("TLS connection error: {:?}", e);
+            ConnectionError::NoBackendAvailable
+          }).map(|stream| BackendSocket::TLS(stream))
+        } else {
+          Err(ConnectionError::NoBackendAvailable)
+        }
+      },
+    };
+
     if conn.is_ok() {
       //self.retry_policy.succeed();
       self.inc_connections();
