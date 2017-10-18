@@ -307,7 +307,7 @@ mod tests {
   use serde_json;
   use hex::FromHex;
   use certificate::split_certificate_chain;
-  use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance};
+  use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance,BackendProtocol};
   use messages::{BackendMetricsData,MetricsData,FilteredData,Percentiles};
 
   #[test]
@@ -362,6 +362,7 @@ mod tests {
       data:     ConfigCommand::ProxyConfiguration(Order::AddApplication(Application {
                   app_id: String::from("xxx"),
                   sticky_session: true,
+                  backend_protocol: BackendProtocol::TCP,
       })),
       proxy_id: None
     });

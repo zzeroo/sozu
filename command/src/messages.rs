@@ -169,8 +169,15 @@ impl<'de> serde::Deserialize<'de> for CertFingerprint {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Application {
-    pub app_id:         String,
-    pub sticky_session: bool,
+    pub app_id:           String,
+    pub sticky_session:   bool,
+    pub backend_protocol: BackendProtocol,
+}
+
+#[derive(Debug,Clone, Copy, PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub enum BackendProtocol {
+  TCP,
+  TLS,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]

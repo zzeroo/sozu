@@ -8,7 +8,7 @@ use std::io::{self,Error,ErrorKind,Read};
 use certificate::{calculate_fingerprint,split_certificate_chain};
 use toml;
 
-use messages::Application;
+use messages::{Application,BackendProtocol};
 use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Instance,
   HttpProxyConfiguration,HttpsProxyConfiguration};
 
@@ -181,6 +181,7 @@ pub struct FileAppConfig {
   pub certificate_chain: Option<String>,
   pub backends:          Vec<String>,
   pub sticky_session:    Option<bool>,
+  pub backend_protocol:  BackendProtocol,
 }
 
 impl FileAppConfig {
