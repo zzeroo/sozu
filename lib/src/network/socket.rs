@@ -18,6 +18,36 @@ pub trait SocketHandler {
   fn socket_ref(&self) -> &TcpStream;
 }
 
+#[derive(Debug)]
+pub enum BackendSocket {
+  TCP(TcpStream),
+  TLS(SslStream<TcpStream>),
+}
+
+impl SocketHandler for BackendSocket {
+  fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult) {
+    match *self {
+      BackendSocket::TCP(ref mut stream) => stream.socket_read(buf),
+      BackendSocket::TLS(ref mut stream) => stream.socket_read(buf),
+    }
+  }
+
+  fn socket_write(&mut self,  buf: &[u8]) -> (usize, SocketResult) {
+    match *self {
+      BackendSocket::TCP(ref mut stream) => stream.socket_write(buf),
+      BackendSocket::TLS(ref mut stream) => stream.socket_write(buf),
+    }
+  }
+
+  fn socket_ref(&self) -> &TcpStream {
+    match self {
+      &BackendSocket::TCP(ref stream) => stream,
+      &BackendSocket::TLS(ref stream) => stream.get_ref()
+    }
+
+  }
+}
+
 impl SocketHandler for TcpStream {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult) {
     let mut size = 0usize;
