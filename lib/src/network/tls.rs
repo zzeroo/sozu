@@ -41,7 +41,7 @@ use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
   Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
 use network::http::{self,DefaultAnswers};
-use network::socket::{SocketHandler,SocketResult,server_bind};
+use network::socket::{BackendSocket,SocketHandler,SocketResult,server_bind};
 use network::trie::*;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
 use network::protocol::http::DefaultAnswerStatus;
@@ -217,7 +217,7 @@ impl ProxyClient for TlsClient {
     }
   }
 
-  fn set_back_socket(&mut self, sock:TcpStream) {
+  fn set_back_socket(&mut self, sock: BackendSocket) {
     unwrap_msg!(self.http()).set_back_socket(sock)
   }
 
@@ -969,7 +969,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           });
 
           socket.set_nodelay(true);
-          client.set_back_socket(socket);
+          client.set_back_socket(BackendSocket::TCP(socket));
 
           if old_app_id == new_app_id {
             Ok(BackendConnectAction::Replace)

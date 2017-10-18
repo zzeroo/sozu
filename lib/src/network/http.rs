@@ -27,7 +27,7 @@ use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::protocol::http::DefaultAnswerStatus;
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
-use network::socket::{SocketHandler,SocketResult,server_bind};
+use network::socket::{BackendSocket,SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
 use parser::http11::hostname_and_port;
 use util::UnwrapLog;
@@ -47,7 +47,6 @@ pub enum State {
 
 pub struct Client {
   pub frontend:   TcpStream,
-  backend:        Option<TcpStream>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   instance:       Option<Rc<RefCell<Backend>>>,
@@ -72,7 +71,6 @@ impl Client {
       let request_id = Uuid::new_v4().hyphenated().to_string();
       let log_ctx    = format!("{}\tunknown\t", &request_id);
       let client = Client {
-        backend:        None,
         token:          None,
         backend_token:  None,
         instance:       None,
@@ -117,9 +115,16 @@ impl Client {
     }
   }
 
-  pub fn http(&mut self) -> Option<&mut Http<TcpStream>> {
+  pub fn http_mut(&mut self) -> Option<&mut Http<TcpStream>> {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http) => Some(http),
+      _ => None
+    }
+  }
+
+  pub fn http(&self) -> Option<&Http<TcpStream>> {
+    match *unwrap_msg!(self.protocol.as_ref()) {
+      State::Http(ref http) => Some(http),
       _ => None
     }
   }
@@ -131,7 +136,7 @@ impl ProxyClient for Client {
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
-    self.backend.as_ref()
+    self.http().and_then(|http| http.backend.as_ref().map(|stream| stream.socket_ref()))
   }
 
   fn front_token(&self)  -> Option<Token> {
@@ -179,12 +184,11 @@ impl ProxyClient for Client {
     &mut self.metrics
   }
 
-  fn set_back_socket(&mut self, socket: TcpStream) {
+  fn set_back_socket(&mut self, socket: BackendSocket) {
     match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.set_back_socket(unwrap_msg!(socket.try_clone())),
+      State::Http(ref mut http)      => http.set_back_socket(socket),
       State::WebSocket(ref mut pipe) => {} /*pipe.set_back_socket(unwrap_msg!(socket.try_clone()))*/
     }
-    self.backend         = Some(socket);
   }
 
   fn set_front_token(&mut self, token: Token) {
@@ -217,8 +221,7 @@ impl ProxyClient for Client {
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), unwrap_msg!(self.token).0,
       unwrap_msg!(self.backend_token).0);
-    let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
-    self.backend       = None;
+    let addr:Option<SocketAddr> = self.http().and_then(|http| http.backend.as_ref()).and_then(|sock| sock.socket_ref().peer_addr().ok());
     self.backend_token = None;
     (unwrap_msg!(self.http()).app_id.clone(), addr)
   }
@@ -430,7 +433,7 @@ impl ServerConfiguration {
   }
 
   pub fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
-    client.http().map(|h| h.set_app_id(String::from(app_id)));
+    client.http_mut().map(|h| h.set_app_id(String::from(app_id)));
 
     match self.instances.backend_from_app_id(app_id) {
       Err(e) => {
@@ -440,7 +443,7 @@ impl ServerConfiguration {
       Ok((backend, conn))  => {
         client.back_connected = BackendConnectionStatus::Connecting;
         if front_should_stick {
-          client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
+          client.http_mut().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
         }
         client.metrics.backend_id = Some(backend.borrow().instance_id.clone());
         client.metrics.backend_start();
@@ -452,7 +455,7 @@ impl ServerConfiguration {
   }
 
   pub fn backend_from_sticky_session(&mut self, client: &mut Client, app_id: &str, sticky_session: u32) -> Result<TcpStream,ConnectionError> {
-    client.http().map(|h| h.set_app_id(String::from(app_id)));
+    client.http_mut().map(|h| h.set_app_id(String::from(app_id)));
 
     match self.instances.backend_from_sticky_session(app_id, sticky_session) {
       Err(e) => {
@@ -462,7 +465,7 @@ impl ServerConfiguration {
       },
       Ok((backend, conn))  => {
         client.back_connected = BackendConnectionStatus::Connecting;
-        client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
+        client.http_mut().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
         client.metrics.backend_id = Some(backend.borrow().instance_id.clone());
         client.metrics.backend_start();
         client.instance = Some(backend);
@@ -572,7 +575,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           }
 
           socket.set_nodelay(true);
-          client.set_back_socket(socket);
+          client.set_back_socket(BackendSocket::TCP(socket));
           client.readiness().back_interest.insert(Ready::writable());
           client.readiness().back_interest.insert(UnixReady::hup());
           client.readiness().back_interest.insert(UnixReady::error());

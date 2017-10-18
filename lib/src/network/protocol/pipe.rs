@@ -10,7 +10,7 @@ use uuid::Uuid;
 use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
 use network::session::{Readiness,SessionMetrics};
-use network::socket::{SocketHandler,SocketResult};
+use network::socket::{BackendSocket,SocketHandler,SocketResult};
 use nom::HexDisplay;
 
 type BackendToken = Token;
@@ -23,7 +23,7 @@ pub enum ClientStatus {
 
 pub struct Pipe<Front:SocketHandler> {
   pub frontend:       Front,
-  backend:            TcpStream,
+  backend:            BackendSocket,
   token:              Option<Token>,
   backend_token:      Option<Token>,
   pub front_buf:      Checkout<BufferQueue>,
@@ -38,7 +38,7 @@ pub struct Pipe<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Pipe<Front> {
-  pub fn new(frontend: Front, backend: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Pipe<Front>> {
+  pub fn new(frontend: Front, backend: BackendSocket, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Pipe<Front>> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\tunknown\t", &request_id);
     let client = Pipe {
@@ -80,7 +80,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   pub fn back_socket(&self)  -> Option<&TcpStream> {
-    Some(&self.backend)
+    Some(self.backend.socket_ref())
   }
 
   pub fn front_token(&self)  -> Option<Token> {

@@ -27,7 +27,7 @@ use network::{Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
 use network::buffer_queue::BufferQueue;
-use network::socket::{SocketHandler,SocketResult,server_bind};
+use network::socket::{BackendSocket,SocketHandler,SocketResult,server_bind};
 
 use util::UnwrapLog;
 
@@ -46,7 +46,7 @@ pub enum ConnectionStatus {
 
 pub struct Client {
   sock:           TcpStream,
-  backend:        Option<TcpStream>,
+  backend:        Option<BackendSocket>,
   front_buf:      Checkout<BufferQueue>,
   back_buf:       Checkout<BufferQueue>,
   token:          Option<Token>,
@@ -94,7 +94,7 @@ impl Client {
       Some(SocketAddr::V6(addr)) => format!("{}", addr),
     };
 
-    let backend = match self.backend.as_ref().and_then(|backend| backend.peer_addr().ok()) {
+    let backend = match self.backend.as_ref().and_then(|backend| backend.socket_ref().peer_addr().ok()) {
       None => String::from("-"),
       Some(SocketAddr::V4(addr)) => format!("{}", addr),
       Some(SocketAddr::V6(addr)) => format!("{}", addr),
@@ -124,7 +124,7 @@ impl ProxyClient for Client {
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
-    self.backend.as_ref()
+    self.backend.as_ref().map(|stream| stream.socket_ref())
   }
 
   fn front_token(&self)  -> Option<Token> {
@@ -146,7 +146,7 @@ impl ProxyClient for Client {
     }
   }
 
-  fn set_back_socket(&mut self, socket: TcpStream) {
+  fn set_back_socket(&mut self, socket: BackendSocket) {
     self.backend       = Some(socket);
   }
 
@@ -175,8 +175,8 @@ impl ProxyClient for Client {
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-
-    let addr = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
+    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0);
+    let addr = self.backend.as_ref().and_then(|sock| sock.socket_ref().peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
     (self.app_id.clone(), addr)
@@ -492,7 +492,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     let stream = try!(TcpStream::connect(backend_addr).map_err(|_| ConnectionError::ToBeDefined));
     stream.set_nodelay(true);
 
-    client.set_back_socket(stream);
+    client.set_back_socket(BackendSocket::TCP(stream));
     client.readiness().front_interest.insert(Ready::readable() | Ready::writable());
     client.readiness().back_interest.insert(Ready::readable() | Ready::writable());
     Ok(BackendConnectAction::New)

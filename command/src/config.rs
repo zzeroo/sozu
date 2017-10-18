@@ -262,6 +262,7 @@ impl HttpAppConfig {
     v.push(Order::AddApplication(Application {
       app_id: self.app_id.clone(),
       sticky_session: false,
+      backend_protocol: BackendProtocol::TCP,
     }));
 
     //create the front both for HTTP and HTTPS if possible
@@ -332,6 +333,7 @@ impl TcpAppConfig {
     v.push(Order::AddApplication(Application {
       app_id: self.app_id.clone(),
       sticky_session: false,
+      backend_protocol: BackendProtocol::TCP,
     }));
 
     v.push(Order::AddTcpFront(TcpFront {

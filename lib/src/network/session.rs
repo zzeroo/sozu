@@ -24,6 +24,7 @@ use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessage
 
 use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
+use network::socket::BackendSocket;
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
@@ -215,7 +216,7 @@ pub trait ProxyClient {
   fn back_token(&self)   -> Option<Token>;
   fn close(&mut self);
   fn log_context(&self)  -> String;
-  fn set_back_socket(&mut self, TcpStream);
+  fn set_back_socket(&mut self, BackendSocket);
   fn set_front_token(&mut self, token: Token);
   fn set_back_token(&mut self, token: Token);
   fn back_connected(&self)     -> BackendConnectionStatus;
