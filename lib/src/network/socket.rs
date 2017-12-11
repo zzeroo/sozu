@@ -1,7 +1,7 @@
 use std::io::{self,ErrorKind,Read,Write};
 use std::net::{SocketAddr,SocketAddrV4,SocketAddrV6};
 use mio::tcp::{TcpListener,TcpStream};
-use openssl::ssl::{Error, SslStream};
+use openssl::ssl::{Error, SslStream, MidHandshakeSslStream, HandshakeError};
 use net2::TcpBuilder;
 use net2::unix::UnixTcpBuilderExt;
 
@@ -18,10 +18,9 @@ pub trait SocketHandler {
   fn socket_ref(&self) -> &TcpStream;
 }
 
-#[derive(Debug)]
 pub enum BackendSocket {
   TCP(TcpStream),
-  TLS(SslStream<TcpStream>),
+  TLS(BackendSslStream),
 }
 
 impl SocketHandler for BackendSocket {
@@ -42,7 +41,7 @@ impl SocketHandler for BackendSocket {
   fn socket_ref(&self) -> &TcpStream {
     match self {
       &BackendSocket::TCP(ref stream) => stream,
-      &BackendSocket::TLS(ref stream) => stream.get_ref()
+      &BackendSocket::TLS(ref stream) => stream.socket_ref()
     }
 
   }
@@ -99,6 +98,115 @@ impl SocketHandler for TcpStream {
   }
 
   fn socket_ref(&self) -> &TcpStream { self }
+}
+
+pub struct BackendSslStream {
+  ssl: Option<BackendSslState>,
+}
+
+impl BackendSslStream {
+  pub fn new(res: Result<SslStream<TcpStream>, HandshakeError<TcpStream>> ) -> Option<BackendSslStream> {
+    match res {
+      Ok(stream) => {
+        Some(BackendSslStream {
+          ssl: Some(BackendSslState::Ssl(stream)),
+        })
+      },
+      Err(HandshakeError::SetupFailure(e)) => {
+        error!("error connecting: {:?}", e);
+        None
+      },
+      Err(HandshakeError::Failure(mid)) => {
+        error!("error connecting: {:?}", mid);
+        Some(BackendSslStream {
+          ssl: Some(BackendSslState::Handshake(mid)),
+        })
+      },
+      Err(HandshakeError::Interrupted(mid)) => {
+        info!("first handshake interruped");
+        Some(BackendSslStream {
+          ssl: Some(BackendSslState::Handshake(mid)),
+        })
+      }
+    }
+  }
+
+}
+
+pub enum BackendSslState {
+  Handshake(MidHandshakeSslStream<TcpStream>),
+  Ssl(SslStream<TcpStream>),
+}
+
+impl BackendSslState {
+  pub fn handshake(self) -> (Option<BackendSslState>, SocketResult) {
+    match self {
+      BackendSslState::Handshake(stream) => {
+        match stream.handshake() {
+          Ok(new_stream) => {
+            (Some(BackendSslState::Ssl(new_stream)), SocketResult::Continue)
+          },
+          Err(HandshakeError::SetupFailure(e)) => {
+            error!("error connecting: {:?}", e);
+            (None, SocketResult::Error)
+          },
+          Err(HandshakeError::Failure(mid)) => {
+            error!("error connecting: {:?}", mid);
+            (Some(BackendSslState::Handshake(mid)), SocketResult::Error)
+          },
+          Err(HandshakeError::Interrupted(new_mid)) => {
+            info!("handshake interrupted");
+            (Some(BackendSslState::Handshake(new_mid)), SocketResult::Continue)
+          }
+        }
+      },
+      ssl => (Some(ssl), SocketResult::Continue),
+    }
+  }
+}
+
+impl SocketHandler for BackendSslStream {
+  fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult) {
+    let ssl = self.ssl.take().expect("the SSL state should not be None");
+    match ssl {
+      BackendSslState::Ssl(mut stream) => {
+        let res = stream.socket_read(buf);
+        self.ssl = Some(BackendSslState::Ssl(stream));
+        res
+      },
+      mid_handshake => {
+        let (new_ssl, res) = mid_handshake.handshake();
+        self.ssl = new_ssl;
+        info!("socket_read mid handshake res: {:?}", (0, res));
+        (0, res)
+      }
+    }
+  }
+
+  fn socket_write(&mut self,  buf: &[u8]) -> (usize, SocketResult) {
+    let ssl = self.ssl.take().expect("the SSL state should not be None");
+    match ssl {
+      BackendSslState::Ssl(mut stream) => {
+        let res = stream.socket_write(buf);
+        self.ssl = Some(BackendSslState::Ssl(stream));
+        res
+      },
+      mid_handshake => {
+        let (new_ssl, res) = mid_handshake.handshake();
+        self.ssl = new_ssl;
+        info!("socket_write mid handshake res: {:?}", (0, res));
+        (0, res)
+      },
+    }
+  }
+
+  fn socket_ref(&self) -> &TcpStream {
+    match self.ssl {
+      Some(BackendSslState::Ssl(ref stream)) => stream.socket_ref(),
+      Some(BackendSslState::Handshake(ref stream)) => stream.get_ref(),
+      None => panic!("we should not have to ask for socket_ref on an invalid connection"),
+    }
+  }
 }
 
 impl SocketHandler for SslStream<TcpStream> {

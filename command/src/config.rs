@@ -181,7 +181,7 @@ pub struct FileAppConfig {
   pub certificate_chain: Option<String>,
   pub backends:          Vec<String>,
   pub sticky_session:    Option<bool>,
-  pub backend_protocol:  BackendProtocol,
+  pub backend_protocol:  Option<BackendProtocol>,
 }
 
 impl FileAppConfig {
@@ -195,6 +195,7 @@ impl FileAppConfig {
             ip_address: ip,
             port:       port,
             backends:   self.backends,
+            backend_protocol: self.backend_protocol.unwrap_or(BackendProtocol::TCP),
           }))
         },
         (None, Some(_)) => Err(String::from("missing IP address for TCP application")),
@@ -237,7 +238,7 @@ impl FileAppConfig {
         certificate_chain: chain_opt,
         backends:          self.backends,
         sticky_session:    sticky_session,
-
+        backend_protocol:  self.backend_protocol.unwrap_or(BackendProtocol::TCP),
       }))
     }
   }
@@ -253,6 +254,7 @@ pub struct HttpAppConfig {
   pub certificate_chain: Option<Vec<String>>,
   pub backends:          Vec<String>,
   pub sticky_session:    bool,
+  pub backend_protocol:  BackendProtocol,
 }
 
 impl HttpAppConfig {
@@ -262,7 +264,7 @@ impl HttpAppConfig {
     v.push(Order::AddApplication(Application {
       app_id: self.app_id.clone(),
       sticky_session: false,
-      backend_protocol: BackendProtocol::TCP,
+      backend_protocol: self.backend_protocol,
     }));
 
     //create the front both for HTTP and HTTPS if possible
@@ -324,6 +326,7 @@ pub struct TcpAppConfig {
   pub ip_address:        String,
   pub port:              u16,
   pub backends:          Vec<String>,
+  pub backend_protocol:  BackendProtocol,
 }
 
 impl TcpAppConfig {
@@ -333,7 +336,7 @@ impl TcpAppConfig {
     v.push(Order::AddApplication(Application {
       app_id: self.app_id.clone(),
       sticky_session: false,
-      backend_protocol: BackendProtocol::TCP,
+      backend_protocol: self.backend_protocol,
     }));
 
     v.push(Order::AddTcpFront(TcpFront {
@@ -593,6 +596,21 @@ mod tests {
       default_name: None,
     };
     println!("https: {:?}", to_string(&https));
+    let app =  FileAppConfig {
+      ip_address:  Some(String::from("127.0.0.1")),
+      port:        Some(1026),
+      hostname:    None,
+      path_begin:  None,
+      certificate: None,
+      key:         None,
+      certificate_chain: None,
+      backends:          vec!(),
+      sticky_session:    None,
+      backend_protocol:  Some(BackendProtocol::TCP),
+    };
+    let mut apps = HashMap::new();
+    apps.insert(String::from("MyApp"), app);
+
     let config = FileConfig {
       command_socket: String::from("./command_folder/sock"),
       saved_state: None,
@@ -613,7 +631,7 @@ mod tests {
       http:  Some(http),
       https: Some(https),
       tcp:   None,
-      applications: None,
+      applications: Some(apps),
     };
 
     println!("config: {:?}", to_string(&config));

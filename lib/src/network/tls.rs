@@ -783,7 +783,7 @@ impl ServerConfiguration {
     if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
       client.http().map(|h| h.set_app_id(app_id.clone()));
 
-      match self.instances.backend_from_app_id(&app_id, protocol) {
+      match self.instances.backend_from_app_id(&app_id, protocol, Some(real_host)) {
         Err(e) => {
           client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
           Err(e)
@@ -805,12 +805,13 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_sticky_session(&mut self, client: &mut TlsClient, app_id: &str, sticky_session: u32, protocol: BackendProtocol)
+  pub fn backend_from_sticky_session(&mut self, client: &mut TlsClient, app_id: &str, sticky_session: u32,
+    protocol: BackendProtocol, server_name: Option<&str>)
     -> Result<BackendSocket,ConnectionError> {
 
     client.http().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.instances.backend_from_sticky_session(app_id, sticky_session, protocol) {
+    match self.instances.backend_from_sticky_session(app_id, sticky_session, protocol, server_name) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
         client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
@@ -937,7 +938,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
       let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
       let conn = match (front_should_stick, sticky_session) {
-        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session, protocol),
+        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session, protocol, Some(host)),
         _ => self.backend_from_request(client, &host, &rl.uri, front_should_stick, protocol),
       };
 

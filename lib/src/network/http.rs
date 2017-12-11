@@ -433,12 +433,13 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str, front_should_stick: bool, protocol: BackendProtocol)
+  pub fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str, front_should_stick: bool,
+    protocol: BackendProtocol, server_name: &str)
     -> Result<BackendSocket,ConnectionError> {
 
     client.http_mut().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.instances.backend_from_app_id(app_id, protocol) {
+    match self.instances.backend_from_app_id(app_id, protocol, Some(server_name)) {
       Err(e) => {
         client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
         Err(e)
@@ -457,12 +458,12 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_sticky_session(&mut self, client: &mut Client, app_id: &str, sticky_session: u32, protocol: BackendProtocol)
-    -> Result<BackendSocket,ConnectionError> {
+  pub fn backend_from_sticky_session(&mut self, client: &mut Client, app_id: &str, sticky_session: u32,
+    protocol: BackendProtocol, server_name: &str) -> Result<BackendSocket,ConnectionError> {
 
     client.http_mut().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.instances.backend_from_sticky_session(app_id, sticky_session, protocol) {
+    match self.instances.backend_from_sticky_session(app_id, sticky_session, protocol, Some(server_name)) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
         client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
@@ -561,8 +562,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
 
       let conn = match (front_should_stick, sticky_session) {
-        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session, protocol),
-        _ => self.backend_from_app_id(client, &app_id, front_should_stick, protocol),
+        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session, protocol, host),
+        _ => self.backend_from_app_id(client, &app_id, front_should_stick, protocol, host),
       };
 
       match conn {

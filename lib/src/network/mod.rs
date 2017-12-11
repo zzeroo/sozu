@@ -3,7 +3,7 @@
 use mio;
 use std::fmt;
 use std::net::SocketAddr;
-use openssl::ssl::{SslMethod, SslConnectorBuilder};
+use openssl::ssl::{SslMethod, SslConnectorBuilder, SslContextBuilder, SSL_VERIFY_NONE};
 
 pub mod buffer_queue;
 #[macro_use] pub mod metrics;
@@ -25,7 +25,7 @@ pub mod session;
 use mio::Token;
 
 use self::retry::RetryPolicy;
-use self::socket::BackendSocket;
+use self::socket::{BackendSocket, BackendSslStream};
 
 use sozu_command::messages::BackendProtocol;
 
@@ -223,13 +223,13 @@ impl Backend {
     }
   }
 
-  pub fn try_connect(&mut self, protocol: BackendProtocol) -> Result<BackendSocket, ConnectionError> {
+  pub fn try_connect(&mut self, protocol: BackendProtocol, server_name: Option<&str>) -> Result<BackendSocket, ConnectionError> {
     if self.status != BackendStatus::Normal {
       return Err(ConnectionError::NoBackendAvailable);
     }
 
     //FIXME: what happens if the connect() call fails with EINPROGRESS?
-    let mut conn = match protocol {
+    let conn = match protocol {
       BackendProtocol::TCP => {
         let mut c = mio::tcp::TcpStream::connect(&self.address)
           .map_err(|_| ConnectionError::NoBackendAvailable);
@@ -237,17 +237,23 @@ impl Backend {
         c.map(|stream| BackendSocket::TCP(stream))
       },
       BackendProtocol::TLS => {
+        let server_name = server_name.expect("we should get a server name when connectin to a TLS backend");
+
         let connector = SslConnectorBuilder::new(SslMethod::tls()).map_err(|e| {
           error!("TLS connection builder error: {:?}", e);
           ConnectionError::NoBackendAvailable
-        }).map(|builder| builder.build());
+        }).map(|mut builder| {
+          //FIXME: WE SHOULD NOT USE SSL_VERIFY_NONE IN PRODUCTION
+          builder.builder_mut().set_verify(SSL_VERIFY_NONE);
+          builder.build()
+        });
         if let (Ok(c), Ok(stream)) = (connector, mio::tcp::TcpStream::connect(&self.address)) {
           stream.set_nodelay(true);
-          error!("DEFAULT DOMAIN TEST.COM IS WRONG");
-          c.connect("test.com", stream).map_err(|e| {
-            error!("TLS connection error: {:?}", e);
-            ConnectionError::NoBackendAvailable
-          }).map(|stream| BackendSocket::TLS(stream))
+
+          match BackendSslStream::new(c.connect(server_name, stream)) {
+            None => Err(ConnectionError::NoBackendAvailable),
+            Some(stream) => Ok(BackendSocket::TLS(stream)),
+          }
         } else {
           Err(ConnectionError::NoBackendAvailable)
         }
