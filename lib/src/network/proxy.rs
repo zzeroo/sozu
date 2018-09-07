@@ -903,7 +903,6 @@ impl Server {
         }
       }
     };
-    info!("create_client http slab count: {}, client connections: {}", self.clients.len(), self.nb_connections);
     res
   }
 
