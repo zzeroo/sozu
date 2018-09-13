@@ -392,6 +392,7 @@ impl Server {
 
           let mut tokens = HashSet::new();
           let mut frontend_tokens = HashSet::new();
+          let mut abandoned_tokens = HashSet::new();
 
           let mut count = 0;
           let duration = self.zombie_check_interval.clone();
@@ -403,7 +404,7 @@ impl Server {
                 if !t.contains(&Token(i)) {
                   info!("invalid token for zombie, closing now");
                   client.borrow().print_state();
-                  frontend_tokens.insert(Token(i));
+                  abandoned_tokens.insert(Token(i));
                   count += 1;
                 } else {
                   if !frontend_tokens.contains(&t[0]) {
@@ -419,6 +420,12 @@ impl Server {
                 }
               }
             }
+          }
+
+          for tk in abandoned_tokens.iter() {
+            info!("zombie check: removing abandoned client at {:?}", tk);
+            let cl = self.to_client(*tk);
+            self.clients.remove(cl);
           }
 
           for tk in frontend_tokens.iter() {
