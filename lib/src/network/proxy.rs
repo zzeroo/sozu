@@ -1120,10 +1120,13 @@ impl Server {
     match res {
       Ok(BackendConnectAction::Reuse) => {
         debug!("keepalive, reusing backend connection");
+        incr!("backend_connect.reuse");
       }
       Ok(BackendConnectAction::Replace) => {
+        incr!("backend_connect.replace");
       },
       Ok(BackendConnectAction::New) => {
+        incr!("backend_connect.new");
       },
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) |
         Err(ConnectionError::HttpsRedirect) | Err(ConnectionError::InvalidHost) => {
@@ -1140,6 +1143,7 @@ impl Server {
     match order {
       ClientResult::CloseClient     => self.close_client(token),
       ClientResult::CloseBackend(opt) => {
+        incr!("close_backend");
         info!("{:?} got CloseBackend({:?})", token, opt);
         if let Some(backend_token) = opt {
           let cl = self.to_client(backend_token);
@@ -1156,6 +1160,7 @@ impl Server {
         }
       },
       ClientResult::ReconnectBackend(main_token, backend_token)  => {
+        incr!("reconnect_backend");
         info!("{:?} got ReconnectBackend({:?}, {:?})", token, main_token, backend_token);
         if let Some(t) = backend_token {
           let cl = self.to_client(t);
