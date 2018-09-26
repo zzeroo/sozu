@@ -238,14 +238,14 @@ impl<V:Debug> TrieNode<V> {
     let mut partial_key = key.to_vec();
     partial_key.reverse();
     let res = self.domain_lookup_recursive(&partial_key);
-    //println!(" => {:?}", res.map(|(k,v)| (str::from_utf8(k).unwrap().to_owned(), v)));
+    info!("lookup({:?}) => {:?}", str::from_utf8(key).unwrap(), res.map(|(k,v)| (str::from_utf8(k).unwrap().to_owned(), v)));
     res
   }
 
   // specific version that will handle wildcard domains
   pub fn domain_lookup_recursive(&self, partial_key: &[u8]) -> Option<&KeyValue<Key,V>> {
+    info!("domain_lookup '{}' in {:?}", str::from_utf8(partial_key).unwrap(), self.keys.iter().map(|k| str::from_utf8(k).unwrap()).collect::<Vec<_>>());
     assert_ne!(partial_key, &b""[..]);
-    //println!("lookup '{}' in {:?}", str::from_utf8(partial_key).unwrap(), self.keys.iter().map(|k| str::from_utf8(k).unwrap()).collect::<Vec<_>>());
 
     // if we found a result with a wildcard, store it until the end of search
     // because we might find a more precise result

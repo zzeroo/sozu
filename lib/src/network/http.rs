@@ -972,6 +972,7 @@ impl Listener {
   }
 
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&HttpFront> {
+    info!("http::frontend_from_request: looking up {} and {}", host, uri);
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("frontend_from_request: invalid remaining chars after hostname. Host: {}", host);
