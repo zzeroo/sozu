@@ -14,7 +14,8 @@ use std::net::{IpAddr,SocketAddr};
 use std::str::from_utf8_unchecked;
 use time::{SteadyTime, Duration};
 use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod, SslAlert,
-                   Ssl, SslOptions, SslRef, SslStream, SniError, NameType};
+  Ssl, SslOptions, SslRef, SslStream, SniError, NameType, select_next_proto,
+  AlpnError};
 use openssl::x509::X509;
 use openssl::dh::Dh;
 use openssl::pkey::PKey;
@@ -45,8 +46,13 @@ use protocol::{ProtocolResult,Http,Pipe,StickySession};
 use protocol::openssl::TlsHandshake;
 use protocol::http::DefaultAnswerStatus;
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use protocol::h2::Http2;
 use retry::RetryPolicy;
 use util::UnwrapLog;
+
+const SERVER_PROTOS: &'static [u8] = b"\x02h2\x08http/1.1";
+//const SERVER_PROTOS: &'static [u8] = b"\x08http/1.1\x02h2";
+//const SERVER_PROTOS: &'static [u8] = b"\x08http/1.1";
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
@@ -60,7 +66,13 @@ pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, Ssl),
   Handshake(TlsHandshake),
   Http(Http<SslStream<TcpStream>>),
-  WebSocket(Pipe<SslStream<TcpStream>>)
+  WebSocket(Pipe<SslStream<TcpStream>>),
+  Http2(Http2),
+}
+
+pub enum AlpnProtocols {
+  H2,
+  Http11,
 }
 
 pub struct Session {
@@ -177,26 +189,56 @@ impl Session {
         ssl.current_cipher().map(|c| incr!(c.name()));
       });
 
-      let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
-        self.public_address.clone(), self.peer_address, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+      let selected = {
+        let s = handshake.stream.as_ref().and_then(|s| s.ssl().selected_alpn_protocol());
+        info!("selected: {}", unsafe { from_utf8_unchecked(s.unwrap_or(&b""[..])) });
 
-        http.front_readiness = readiness;
-        http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-        State::Http(http)
-      });
+        match s {
+          Some(b"h2") => {
+            AlpnProtocols::H2
+          },
+          Some(b"http/1.1") | None => {
+            AlpnProtocols::Http11
+          }
+          Some(s) => {
+            error!("unknown alpn protocol: {:?}", s);
+            return false;
+          }
+        }
+      };
 
-      if http.is_none() {
-        error!("could not upgrade to HTTP");
-        //we cannot put back the protocol since we moved the stream
-        //self.protocol = Some(State::Handshake(handshake));
-        return false;
+      match selected {
+        AlpnProtocols::H2 => {
+          info!("got h2");
+          let http = State::Http2(Http2 {});
+
+          self.ssl = handshake.ssl;
+          self.protocol = Some(http);
+          return true;
+        },
+        AlpnProtocols::Http11 => {
+          let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
+          self.public_address.clone(), self.peer_address, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+
+            http.front_readiness = readiness;
+            http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+            State::Http(http)
+          });
+
+          if http.is_none() {
+            error!("could not upgrade to HTTP");
+            //we cannot put back the protocol since we moved the stream
+            //self.protocol = Some(State::Handshake(handshake));
+            return false;
+          }
+          gauge_add!("protocol.tls.handshake", -1);
+          gauge_add!("protocol.https", 1);
+
+          self.ssl = handshake.ssl;
+          self.protocol = http;
+          return true;
+        }
       }
-      gauge_add!("protocol.tls.handshake", -1);
-      gauge_add!("protocol.https", 1);
-
-      self.ssl = handshake.ssl;
-      self.protocol = http;
-      return true;
     } else if let State::Http(http) = protocol {
       debug!("https switching to wss");
       let front_token = self.frontend_token;
@@ -861,6 +903,20 @@ impl Listener {
     if let Err(e) = context.set_cipher_list(&config.cipher_list) {
       error!("could not set context cipher list: {:?}", e);
     }
+    if let Err(e) = context.set_alpn_protos(SERVER_PROTOS) {
+      error!("could not set ALPN protocols: {:?}", e);
+    }
+
+    context.set_alpn_select_callback(move |ssl: &mut SslRef, client_protocols: &[u8]| {
+      debug!("got protocols list from client: {:?}", unsafe { from_utf8_unchecked(client_protocols) });
+      match select_next_proto(SERVER_PROTOS, client_protocols) {
+        None => Err(AlpnError::ALERT_FATAL),
+        Some(selected) => {
+          debug!("selected protocol with ALPN: {:?}", unsafe { from_utf8_unchecked(selected) });
+          Ok(selected)
+        }
+      }
+    });
 
     context.set_servername_callback(move |ssl: &mut SslRef, alert: &mut SslAlert| {
       let contexts = unwrap_msg!(ref_ctx.lock());
@@ -980,6 +1036,19 @@ impl Listener {
     if let Err(e) = ctx.set_cipher_list(&self.config.cipher_list) {
       error!("cannot set context cipher list: {:?}", e);
     }
+    if let Err(e) = ctx.set_alpn_protos(SERVER_PROTOS) {
+      error!("could not set ALPN protocols: {:?}", e);
+    }
+    ctx.set_alpn_select_callback(move |ssl: &mut SslRef, client_protocols: &[u8]| {
+      debug!("got ALPN protocols list from client: {:?}", unsafe { from_utf8_unchecked(client_protocols) });
+      match select_next_proto(SERVER_PROTOS, client_protocols) {
+        None => Err(AlpnError::ALERT_FATAL),
+        Some(selected) => {
+          debug!("selected protocol with ALPN: {:?}", unsafe { from_utf8_unchecked(selected) });
+          Ok(selected)
+        }
+      }
+    });
 
     let mut cert_read  = &certificate_and_key.certificate.as_bytes()[..];
     let mut key_read   = &certificate_and_key.key.as_bytes()[..];
