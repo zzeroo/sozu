@@ -1,5 +1,5 @@
 use std::cmp::min;
-use std::io::Write;
+use std::io::{Write,BufRead};
 use std::net::{SocketAddr,IpAddr};
 use std::cell::RefCell;
 use std::rc::Weak;
@@ -12,7 +12,10 @@ use {SessionResult,Readiness,SessionMetrics,Protocol};
 use buffer_queue::BufferQueue;
 use socket::{SocketHandler,SocketResult};
 use pool::{Pool,Checkout,Reset};
-use nom::HexDisplay;
+use nom::{HexDisplay,Offset};
+
+mod parser;
+mod state;
 
 type BackendToken = Token;
 
@@ -21,9 +24,6 @@ pub enum SessionStatus {
   Normal,
   DefaultAnswer,
 }
-
-#[derive(Clone,Debug,PartialEq)]
-pub struct Http2State {}
 
 pub struct Http2<Front:SocketHandler> {
   pub frontend:        Front,
@@ -38,7 +38,7 @@ pub struct Http2<Front:SocketHandler> {
   pub back_readiness:  Readiness,
   pub log_ctx:         String,
   public_address:      Option<IpAddr>,
-  pub state:           Option<Http2State>,
+  pub state:           Option<state::State>,
   pool:                Weak<RefCell<Pool<BufferQueue>>>,
 }
 
@@ -56,7 +56,7 @@ impl<Front:SocketHandler> Http2<Front> {
       front_buf:          None,
       back_buf:           None,
       app_id:             None,
-      state:              None,
+      state:              Some(state::State::new()),
       request_id,
       front_readiness:    Readiness {
                             interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
@@ -150,49 +150,82 @@ impl<Front:SocketHandler> Http2<Front> {
   // Read content from the session
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("http2 readable");
-    error!("todo[{}:{}]: back_hup", file!(), line!());
-    SessionResult::CloseSession
-    /*
-    if self.front_buf.buffer.available_space() == 0 {
-      self.front_readiness.interest.remove(Ready::readable());
-      self.back_readiness.interest.insert(Ready::writable());
+    error!("todo[{}:{}]: readable", file!(), line!());
+
+    if self.front_buf.is_none() {
+      if let Some(p) = self.pool.upgrade() {
+        if let Some(buf) = p.borrow_mut().checkout() {
+          self.front_buf = Some(buf);
+        } else {
+          error!("cannot get front buffer from pool, closing");
+          return SessionResult::CloseSession;
+        }
+      }
+    }
+
+    if self.front_buf.as_ref().unwrap().buffer.available_space() == 0 {
+      if self.backend_token == None {
+        //let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
+        //self.set_answer(DefaultAnswerStatus::Answer413, Rc::new(Vec::from(answer_413.as_bytes())));
+        self.front_readiness.interest.remove(Ready::readable());
+        self.front_readiness.interest.insert(Ready::writable());
+      } else {
+        self.front_readiness.interest.remove(Ready::readable());
+        self.back_readiness.interest.insert(Ready::writable());
+      }
       return SessionResult::Continue;
     }
 
-    let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
-    debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_ctx, self.frontend_token, sz);
+    let (sz, res) = self.frontend.socket_read(self.front_buf.as_mut().unwrap().buffer.space());
+    info!("{}\tFRONT: read {} bytes", self.log_ctx, sz);
 
     if sz > 0 {
-      //FIXME: replace with copy()
-      self.front_buf.buffer.fill(sz);
-      self.front_buf.sliced_input(sz);
-      self.front_buf.consume_parsed_data(sz);
-      self.front_buf.slice_output(sz);
-
       count!("bytes_in", sz as i64);
       metrics.bin += sz;
 
-      if self.front_buf.buffer.available_space() == 0 {
+      self.front_buf.as_mut().map(|front_buf| {
+        front_buf.buffer.fill(sz);
+        front_buf.sliced_input(sz);
+        if front_buf.start_parsing_position > front_buf.parsed_position {
+          let to_consume = min(front_buf.input_data_size(), front_buf.start_parsing_position - front_buf.parsed_position);
+          front_buf.consume_parsed_data(to_consume);
+        }
+      });
+
+      if self.front_buf.as_ref().unwrap().buffer.available_space() == 0 {
         self.front_readiness.interest.remove(Ready::readable());
       }
-      self.back_readiness.interest.insert(Ready::writable());
     } else {
       self.front_readiness.event.remove(Ready::readable());
     }
 
     match res {
       SocketResult::Error => {
-        error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.frontend_token);
-        metrics.service_stop();
-        incr!("http2.errors");
-        self.front_readiness.reset();
-        self.back_readiness.reset();
+        let front_readiness = self.front_readiness.clone();
+        let back_readiness  = self.back_readiness.clone();
+        /*
+        self.log_request_error(metrics,
+          &format!("front socket error, closing the connection. Readiness: {:?} -> {:?}", front_readiness, back_readiness));
+        */
+        error!("front socket error, closing the connection. Readiness: {:?} -> {:?}", front_readiness, back_readiness);
         return SessionResult::CloseSession;
       },
       SocketResult::Closed => {
-        metrics.service_stop();
-        self.front_readiness.reset();
-        self.back_readiness.reset();
+        /*
+        //we were in keep alive but the peer closed the connection
+        //FIXME: what happens if the connection was just opened but no data came?
+        if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
+          metrics.service_stop();
+          self.front_readiness.reset();
+          self.back_readiness.reset();
+          return SessionResult::CloseSession;
+        } else {
+          let front_readiness = self.front_readiness.clone();
+          let back_readiness  = self.back_readiness.clone();
+          self.log_request_error(metrics,
+            &format!("front socket error, closing the connection. Readiness: {:?} -> {:?}", front_readiness, back_readiness));
+          return SessionResult::CloseSession;
+        }*/
         return SessionResult::CloseSession;
       },
       SocketResult::WouldBlock => {
@@ -201,15 +234,47 @@ impl<Front:SocketHandler> Http2<Front> {
       SocketResult::Continue => {}
     };
 
-    self.back_readiness.interest.insert(Ready::writable());
-    SessionResult::Continue
-      */
+    self.readable_parse(metrics)
   }
+
+  pub fn readable_parse(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    let mut state = self.state.take().unwrap();
+    let (sz, res) = {
+      state.parse_front(self.front_buf.as_ref().unwrap().unparsed_data())
+    };
+    self.front_buf.as_mut().unwrap().consume_parsed_data(sz);
+    info!("parsed: {:?}", res);
+
+    self.state = Some(state);
+
+    SessionResult::CloseSession
+
+    /*let is_initial = unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial);
+    // if there's no host, continue parsing until we find it
+    let has_host = unwrap_msg!(self.state.as_ref()).has_host();
+    if !has_host {
+      self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
+        &mut self.front_buf.as_mut().unwrap(), &self.sticky_name));
+      if unwrap_msg!(self.state.as_ref()).is_front_error() {
+        self.log_request_error(metrics, "front parsing error, closing the connection");
+        incr!("http.front_parse_errors");
+
+        // increment active requests here because it will be decremented right away
+        // when closing the connection. It's slightly easier than decrementing it
+        // at every place we return SessionResult::CloseSession
+        gauge_add!("http.active_requests", 1);
+
+        return SessionResult::CloseSession;
+      }
+    }
+    */
+  }
+
 
   // Forward content to session
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("http2 writable");
-    error!("todo[{}:{}]: back_hup", file!(), line!());
+    error!("todo[{}:{}]: writable", file!(), line!());
     SessionResult::CloseSession
     /*
     if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
@@ -268,7 +333,7 @@ impl<Front:SocketHandler> Http2<Front> {
   // Forward content to application
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("http2 back_writable");
-    error!("todo[{}:{}]: back_hup", file!(), line!());
+    error!("todo[{}:{}]: back_writable", file!(), line!());
     SessionResult::CloseSession
     /*
     if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
@@ -327,7 +392,7 @@ impl<Front:SocketHandler> Http2<Front> {
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("http2 back_readable");
-    error!("todo[{}:{}]: back_hup", file!(), line!());
+    error!("todo[{}:{}]: back_readable", file!(), line!());
     SessionResult::CloseSession
     /*
     if self.back_buf.buffer.available_space() == 0 {
