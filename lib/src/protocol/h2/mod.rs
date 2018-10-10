@@ -15,6 +15,7 @@ use pool::{Pool,Checkout,Reset};
 use nom::{HexDisplay,Offset};
 
 mod parser;
+mod serializer;
 mod state;
 
 type BackendToken = Token;
@@ -203,29 +204,10 @@ impl<Front:SocketHandler> Http2<Front> {
       SocketResult::Error => {
         let front_readiness = self.front_readiness.clone();
         let back_readiness  = self.back_readiness.clone();
-        /*
-        self.log_request_error(metrics,
-          &format!("front socket error, closing the connection. Readiness: {:?} -> {:?}", front_readiness, back_readiness));
-        */
         error!("front socket error, closing the connection. Readiness: {:?} -> {:?}", front_readiness, back_readiness);
         return SessionResult::CloseSession;
       },
       SocketResult::Closed => {
-        /*
-        //we were in keep alive but the peer closed the connection
-        //FIXME: what happens if the connection was just opened but no data came?
-        if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
-          metrics.service_stop();
-          self.front_readiness.reset();
-          self.back_readiness.reset();
-          return SessionResult::CloseSession;
-        } else {
-          let front_readiness = self.front_readiness.clone();
-          let back_readiness  = self.back_readiness.clone();
-          self.log_request_error(metrics,
-            &format!("front socket error, closing the connection. Readiness: {:?} -> {:?}", front_readiness, back_readiness));
-          return SessionResult::CloseSession;
-        }*/
         return SessionResult::CloseSession;
       },
       SocketResult::WouldBlock => {
@@ -245,9 +227,24 @@ impl<Front:SocketHandler> Http2<Front> {
     self.front_buf.as_mut().unwrap().consume_parsed_data(sz);
     info!("parsed: {:?}", res);
 
-    self.state = Some(state);
+    match res {
+      Err(e) => {
+        error!("error parsing frame: {:?}", e);
+        self.state = Some(state);
+        SessionResult::CloseSession
+      },
+      Ok(frame) => {
+        if state.handle_front(&frame) {
+          self.front_readiness.interest = state.front_interest;
+          self.state = Some(state);
+          SessionResult::Continue
+        } else {
+          self.state = Some(state);
+          SessionResult::CloseSession
+        }
+      }
+    }
 
-    SessionResult::CloseSession
 
     /*let is_initial = unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial);
     // if there's no host, continue parsing until we find it

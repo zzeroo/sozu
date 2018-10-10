@@ -176,6 +176,8 @@ extern crate mio_extras;
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
+#[macro_use]
+extern crate cookie_factory;
 
 #[macro_use] pub mod util;
 #[macro_use] pub mod metrics;
