@@ -13,6 +13,7 @@ use buffer_queue::BufferQueue;
 use socket::{SocketHandler,SocketResult};
 use pool::{Pool,Checkout,Reset};
 use nom::{HexDisplay,Offset};
+use sozu_command::buffer::Buffer;
 
 mod parser;
 mod serializer;
@@ -27,15 +28,13 @@ pub enum SessionStatus {
 }
 
 pub struct Http2<Front:SocketHandler> {
-  pub frontend:        Front,
+  pub frontend:        Connection<Front>,
   backend:             Option<TcpStream>,
   frontend_token:      Token,
   backend_token:       Option<Token>,
-  pub front_buf:       Option<Checkout<BufferQueue>>,
   back_buf:            Option<Checkout<BufferQueue>>,
   pub app_id:          Option<String>,
   pub request_id:      String,
-  pub front_readiness: Readiness,
   pub back_readiness:  Readiness,
   pub log_ctx:         String,
   public_address:      Option<IpAddr>,
@@ -50,19 +49,14 @@ impl<Front:SocketHandler> Http2<Front> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\tunknown\t", &request_id);
     let session = Http2 {
-      frontend,
+      frontend: Connection::new(frontend),
       frontend_token,
       backend:            None,
       backend_token:      None,
-      front_buf:          None,
       back_buf:           None,
       app_id:             None,
       state:              Some(state::State::new()),
       request_id,
-      front_readiness:    Readiness {
-                            interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
-                            event: UnixReady::from(Ready::empty()),
-      },
       back_readiness:    Readiness {
                             interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
                             event: UnixReady::from(Ready::empty()),
@@ -84,7 +78,7 @@ impl<Front:SocketHandler> Http2<Front> {
   }
 
   pub fn front_socket(&self) -> &TcpStream {
-    self.frontend.socket_ref()
+    self.frontend.socket.socket_ref()
   }
 
   pub fn back_socket(&self)  -> Option<&TcpStream> {
@@ -115,7 +109,7 @@ impl<Front:SocketHandler> Http2<Front> {
   }
 
   pub fn front_readiness(&mut self) -> &mut Readiness {
-    &mut self.front_readiness
+    &mut self.frontend.readiness
   }
 
   pub fn back_readiness(&mut self) -> &mut Readiness {
@@ -133,13 +127,13 @@ impl<Front:SocketHandler> Http2<Front> {
     if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
       if self.back_readiness.event.is_readable() {
         self.back_readiness().interest.insert(Ready::readable());
-        error!("Http2::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?} -> {:?}", self.front_readiness, self.back_readiness);
+        error!("Http2::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?} -> {:?}", self.frontend.readiness, self.back_readiness);
         SessionResult::Continue
       } else {
         SessionResult::CloseSession
       }
     } else {
-      self.front_readiness().interest.insert(Ready::writable());
+      self.frontend.readiness().interest.insert(Ready::writable());
       if self.back_readiness.event.is_readable() {
         self.back_readiness.interest.insert(Ready::readable());
       }
@@ -153,6 +147,7 @@ impl<Front:SocketHandler> Http2<Front> {
     trace!("http2 readable");
     error!("todo[{}:{}]: readable", file!(), line!());
 
+    /* do not handle buffer pooling for now
     if self.front_buf.is_none() {
       if let Some(p) = self.pool.upgrade() {
         if let Some(buf) = p.borrow_mut().checkout() {
@@ -163,46 +158,26 @@ impl<Front:SocketHandler> Http2<Front> {
         }
       }
     }
+    */
 
-    if self.front_buf.as_ref().unwrap().buffer.available_space() == 0 {
+    if self.frontend.read_buffer.available_space() == 0 {
       if self.backend_token == None {
         //let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
         //self.set_answer(DefaultAnswerStatus::Answer413, Rc::new(Vec::from(answer_413.as_bytes())));
-        self.front_readiness.interest.remove(Ready::readable());
-        self.front_readiness.interest.insert(Ready::writable());
+        self.frontend.readiness.interest.remove(Ready::readable());
+        self.frontend.readiness.interest.insert(Ready::writable());
       } else {
-        self.front_readiness.interest.remove(Ready::readable());
+        self.frontend.readiness.interest.remove(Ready::readable());
         self.back_readiness.interest.insert(Ready::writable());
       }
       return SessionResult::Continue;
     }
 
-    let (sz, res) = self.frontend.socket_read(self.front_buf.as_mut().unwrap().buffer.space());
-    info!("{}\tFRONT: read {} bytes", self.log_ctx, sz);
-
-    if sz > 0 {
-      count!("bytes_in", sz as i64);
-      metrics.bin += sz;
-
-      self.front_buf.as_mut().map(|front_buf| {
-        front_buf.buffer.fill(sz);
-        front_buf.sliced_input(sz);
-        if front_buf.start_parsing_position > front_buf.parsed_position {
-          let to_consume = min(front_buf.input_data_size(), front_buf.start_parsing_position - front_buf.parsed_position);
-          front_buf.consume_parsed_data(to_consume);
-        }
-      });
-
-      if self.front_buf.as_ref().unwrap().buffer.available_space() == 0 {
-        self.front_readiness.interest.remove(Ready::readable());
-      }
-    } else {
-      self.front_readiness.event.remove(Ready::readable());
-    }
+    let res = self.frontend.read(metrics);
 
     match res {
       SocketResult::Error => {
-        let front_readiness = self.front_readiness.clone();
+        let front_readiness = self.frontend.readiness.clone();
         let back_readiness  = self.back_readiness.clone();
         error!("front socket error, closing the connection. Readiness: {:?} -> {:?}", front_readiness, back_readiness);
         return SessionResult::CloseSession;
@@ -211,7 +186,6 @@ impl<Front:SocketHandler> Http2<Front> {
         return SessionResult::CloseSession;
       },
       SocketResult::WouldBlock => {
-        self.front_readiness.event.remove(Ready::readable());
       },
       SocketResult::Continue => {}
     };
@@ -222,9 +196,9 @@ impl<Front:SocketHandler> Http2<Front> {
   pub fn readable_parse(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     let mut state = self.state.take().unwrap();
     let (sz, res) = {
-      state.parse_front(self.front_buf.as_ref().unwrap().unparsed_data())
+      state.parse_front(self.frontend.read_buffer.data())
     };
-    self.front_buf.as_mut().unwrap().consume_parsed_data(sz);
+    self.frontend.read_buffer.consume(sz);
     info!("parsed: {:?}", res);
 
     match res {
@@ -235,7 +209,7 @@ impl<Front:SocketHandler> Http2<Front> {
       },
       Ok(frame) => {
         if state.handle_front(&frame) {
-          self.front_readiness.interest = state.front_interest;
+          self.frontend.readiness.interest = state.front_interest;
           self.state = Some(state);
           SessionResult::Continue
         } else {
@@ -272,59 +246,44 @@ impl<Front:SocketHandler> Http2<Front> {
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("http2 writable");
     error!("todo[{}:{}]: writable", file!(), line!());
-    SessionResult::CloseSession
-    /*
-    if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
-      self.back_readiness.interest.insert(Ready::readable());
-      self.front_readiness.interest.remove(Ready::writable());
-      return SessionResult::Continue;
-    }
 
-    let mut sz = 0usize;
-    let mut res = SocketResult::Continue;
-    while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
-      // no more data in buffer, stop here
-      if self.back_buf.next_output_data().len() == 0 {
-        self.back_readiness.interest.insert(Ready::readable());
-        self.front_readiness.interest.remove(Ready::writable());
-        return SessionResult::Continue;
+    let mut state = self.state.take().unwrap();
+    //FIXME: do that in a loop until no more frames or WouldBlock
+    match state.gen_front(self.frontend.write_buffer.space()) {
+      Ok(sz) => {
+        self.frontend.write_buffer.fill(sz);
+        //FIXME: use real condition here to indicate there was nothing to write
+        if sz == 0 {
+
+        }
+      },
+      Err(e) => {
+        self.state = Some(state);
+        error!("error serializing to front write buffer: {:?}", e);
+        return SessionResult::CloseSession;
       }
-      let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
-      res = current_res;
-      self.back_buf.consume_output_data(current_sz);
-      self.back_buf_position += current_sz;
-      sz += current_sz;
     }
 
-    if sz > 0 {
-      count!("bytes_out", sz as i64);
-      self.back_readiness.interest.insert(Ready::readable());
-      metrics.bout += sz;
-    }
+    self.frontend.readiness.interest = state.front_interest;
 
-    if let Some((front,back)) = self.tokens() {
-      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}",
-        self.log_ctx, front.0, back.0, sz, self.back_buf.output_data_size(),
-        self.back_buf.buffer_position, self.back_buf.start_parsing_position);
-    }
-
+    let res = self.frontend.write(metrics);
     match res {
       SocketResult::Error | SocketResult::Closed => {
         error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.frontend_token);
         incr!("http2.errors");
         metrics.service_stop();
-        self.front_readiness.reset();
+        self.frontend.readiness.reset();
         self.back_readiness.reset();
+        self.state = Some(state);
         return SessionResult::CloseSession;
       },
       SocketResult::WouldBlock => {
-        self.front_readiness.event.remove(Ready::writable());
       },
       SocketResult::Continue => {},
     }
 
+    self.state = Some(state);
     SessionResult::Continue
-    */
   }
 
   // Forward content to application
@@ -334,7 +293,7 @@ impl<Front:SocketHandler> Http2<Front> {
     SessionResult::CloseSession
     /*
     if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
-      self.front_readiness.interest.insert(Ready::readable());
+      self.frontend.readiness.interest.insert(Ready::readable());
       self.back_readiness.interest.remove(Ready::writable());
       return SessionResult::Continue;
     }
@@ -349,7 +308,7 @@ impl<Front:SocketHandler> Http2<Front> {
       while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
         // no more data in buffer, stop here
         if self.front_buf.next_output_data().len() == 0 {
-          self.front_readiness.interest.insert(Ready::readable());
+          self.frontend.readiness.interest.insert(Ready::readable());
           self.back_readiness.interest.remove(Ready::writable());
           return SessionResult::Continue;
         }
@@ -372,7 +331,7 @@ impl<Front:SocketHandler> Http2<Front> {
         error!("{}\tback socket write error, closing connection", self.log_ctx);
         metrics.service_stop();
         incr!("http2.errors");
-        self.front_readiness.reset();
+        self.frontend.readiness.reset();
         self.back_readiness.reset();
         return SessionResult::CloseSession;
       },
@@ -414,7 +373,7 @@ impl<Front:SocketHandler> Http2<Front> {
         self.back_readiness.event.remove(Ready::readable());
       }
       if sz > 0 {
-        self.front_readiness.interest.insert(Ready::writable());
+        self.frontend.readiness.interest.insert(Ready::writable());
         metrics.backend_bin += sz;
       }
 
@@ -423,13 +382,13 @@ impl<Front:SocketHandler> Http2<Front> {
           error!("{}\tback socket read error, closing connection", self.log_ctx);
           metrics.service_stop();
           incr!("http2.errors");
-          self.front_readiness.reset();
+          self.frontend.readiness.reset();
           self.back_readiness.reset();
           return SessionResult::CloseSession;
         },
         SocketResult::Closed => {
           metrics.service_stop();
-          self.front_readiness.reset();
+          self.frontend.readiness.reset();
           self.back_readiness.reset();
           return SessionResult::CloseSession;
         },
@@ -445,3 +404,70 @@ impl<Front:SocketHandler> Http2<Front> {
   }
 }
 
+pub struct Connection<Socket:SocketHandler> {
+  pub socket: Socket,
+  pub readiness: Readiness,
+  pub read_buffer: Buffer,
+  pub write_buffer: Buffer,
+}
+
+impl<Socket:SocketHandler> Connection<Socket> {
+  pub fn new(socket: Socket) -> Self {
+    Connection {
+      socket,
+      readiness: Readiness {
+        interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
+        event: UnixReady::from(Ready::empty()),
+      },
+      //FIXME: capacity can be configured
+      read_buffer: Buffer::with_capacity(16384),
+      //FIXME: capacity can be configured
+      write_buffer: Buffer::with_capacity(16384),
+    }
+  }
+
+  pub fn read(&mut self, metrics: &mut SessionMetrics) -> SocketResult {
+    let (sz, res) = self.socket.socket_read(self.read_buffer.space());
+
+    if sz > 0 {
+      count!("bytes_in", sz as i64);
+      metrics.bin += sz;
+
+      self.read_buffer.fill(sz);
+
+      if self.read_buffer.available_space() == 0 {
+        self.readiness.interest.remove(Ready::readable());
+      }
+    } else {
+      self.readiness.event.remove(Ready::readable());
+    }
+
+    if res == SocketResult::WouldBlock {
+      self.readiness.event.remove(Ready::readable());
+    }
+
+    res
+  }
+
+  pub fn write(&mut self, metrics: &mut SessionMetrics) -> SocketResult {
+    let mut sz = 0usize;
+    let mut res = SocketResult::Continue;
+    while res == SocketResult::Continue && self.write_buffer.available_data() > 0 {
+      let (current_sz, current_res) = self.socket.socket_write(self.write_buffer.data());
+      res = current_res;
+      self.write_buffer.consume(current_sz);
+      sz += current_sz;
+    }
+
+    if sz > 0 {
+      count!("bytes_out", sz as i64);
+      metrics.bout += sz;
+    }
+
+    if res == SocketResult::WouldBlock {
+      self.readiness.event.remove(Ready::writable());
+    }
+
+    res
+  }
+}

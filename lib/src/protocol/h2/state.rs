@@ -74,7 +74,8 @@ impl State {
             header: parser::FrameHeader {
               payload_len: 0,
               frame_type: parser::FrameType::Settings,
-              flags: 0,
+              //FIXME: setting 1 for ACK?
+              flags: 1,
               stream_id: 0,
             },
             payload: None,
@@ -87,22 +88,25 @@ impl State {
         }
       },
       St::ServerPrefaceSent => {
-        info!("unknown frame for now: {:?}", frame);
-        panic!();
+        panic!("unknown frame for now: {:?}", frame);
       }
     }
   }
 
 
   pub fn gen_front(&mut self, mut output: &mut [u8]) -> Result<usize, ()> {
-    let frame = self.front_output.pop_front().unwrap();
-    match serializer::gen_frame_header((output, 0), &frame.header) {
-      Err(e) => {
-        panic!("error serializing: {:?}", e);
-      },
-      Ok((sl, index)) => {
-        Ok(index)
+    if let Some(frame) = self.front_output.pop_front() {
+      match serializer::gen_frame_header((output, 0), &frame.header) {
+        Err(e) => {
+          panic!("error serializing: {:?}", e);
+        },
+        Ok((sl, index)) => {
+          Ok(index)
+        }
       }
+    } else {
+      self.front_interest.remove(Ready::writable());
+      Ok(0)
     }
   }
 }

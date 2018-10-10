@@ -213,8 +213,8 @@ impl Session {
           let mut http = Http2::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
           self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS);
 
-          http.front_readiness = readiness;
-          http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+          http.frontend.readiness = readiness;
+          http.frontend.readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
 
           gauge_add!("protocol.tls.handshake", -1);
           gauge_add!("protocol.http2s", 1);
@@ -777,7 +777,7 @@ impl ProxySession for Session {
       State::Expect(ref expect, _)    => &expect.readiness,
       State::Handshake(ref handshake) => &handshake.readiness,
       State::Http(ref http)           => &http.front_readiness,
-      State::Http2(ref http)          => &http.front_readiness,
+      State::Http2(ref http)          => &http.frontend.readiness,
       State::WebSocket(ref pipe)      => &pipe.front_readiness,
     };
     let rb = match *unwrap_msg!(self.protocol.as_ref()) {
