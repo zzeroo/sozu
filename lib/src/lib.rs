@@ -178,6 +178,7 @@ extern crate mio_extras;
 extern crate quickcheck;
 #[macro_use]
 extern crate cookie_factory;
+extern crate hpack;
 
 #[macro_use] pub mod util;
 #[macro_use] pub mod metrics;

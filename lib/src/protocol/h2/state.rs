@@ -3,6 +3,8 @@ use nom::Offset;
 use std::collections::VecDeque;
 use mio::Ready;
 use mio::unix::UnixReady;
+use hpack::Decoder;
+use std::str::from_utf8;
 
 #[derive(Clone,Debug,PartialEq)]
 pub struct OutputFrame {
@@ -94,7 +96,29 @@ impl State {
         }
       },
       St::ServerPrefaceSent => {
-        panic!("unknown frame for now: {:?}", frame);
+        match frame {
+          parser::Frame::Headers(h) => {
+            let mut decoder = Decoder::new();
+            match decoder.decode(h.header_block_fragment) {
+              Err(e) => {
+                error!("error decoding headers: {:?}", e);
+              },
+              Ok(h) => {
+                info!("got header list: {:?}", h);
+                for header in &h {
+                  info!("{}: {}",
+                    from_utf8(&header.0).unwrap(), from_utf8(&header.1).unwrap());
+                }
+              }
+            };
+
+            false
+          },
+          frame => {
+            panic!("unknown frame for now: {:?}", frame);
+          }
+        }
+
       }
     }
   }
