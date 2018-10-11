@@ -1,5 +1,5 @@
 use super::{parser, serializer};
-use nom::{HexDisplay,Offset};
+use nom::Offset;
 use std::collections::VecDeque;
 use mio::Ready;
 use mio::unix::UnixReady;
@@ -22,6 +22,8 @@ pub struct State {
   pub front_output: VecDeque<Frame>,
   pub state: St,
   pub front_interest: UnixReady,
+  //FIXME: make it configurable,
+  pub max_frame_size: u32,
 }
 
 impl State {
@@ -30,6 +32,7 @@ impl State {
       front_output: VecDeque::new(),
       state: St::Init,
       front_interest: UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
+      max_frame_size: 16384,
     }
   }
 
@@ -51,7 +54,7 @@ impl State {
     }
 
 
-    match parser::frame(input) {
+    match parser::frame(input, self.max_frame_size) {
       Err(e) => {
         error!("parser::frame error: {:?}", e);
         return (consumed, Err(()));

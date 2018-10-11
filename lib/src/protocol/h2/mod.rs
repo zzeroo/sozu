@@ -1,18 +1,15 @@
 use std::cmp::min;
-use std::io::{Write,BufRead};
 use std::net::{SocketAddr,IpAddr};
 use std::cell::RefCell;
 use std::rc::Weak;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use {SessionResult,Readiness,SessionMetrics,Protocol};
 use buffer_queue::BufferQueue;
 use socket::{SocketHandler,SocketResult};
-use pool::{Pool,Checkout,Reset};
-use nom::{HexDisplay,Offset};
+use pool::{Pool,Checkout};
 use sozu_command::buffer::Buffer;
 
 mod parser;
