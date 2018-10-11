@@ -70,7 +70,7 @@ fn convert_frame_type(t: u8) -> Option<FrameType> {
 
 #[derive(Clone,Debug,PartialEq)]
 pub enum Frame<'a> {
-  Data(Data),
+  Data(Data<'a>),
   Headers(Headers<'a>),
   Priority,
   RstStream(RstStream),
@@ -155,23 +155,28 @@ pub fn frame<'a>(input: &'a[u8], max_frame_size: u32) -> IResult<&'a[u8], Frame<
 }
 
 #[derive(Clone,Debug,PartialEq)]
-pub struct Data {
+pub struct Data<'a> {
   pub stream_id: u32,
-  pub payload_len: u32,
-  pub padding_len: u8,
-  pub end: bool,
+  pub payload: &'a[u8],
+  pub end_stream: bool,
 }
 
 pub fn data_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
-  do_parse!(input,
-    pad_length: cond!(header.flags & 0x8 != 0, be_u8) >>
-    (Frame::Data(Data {
-      stream_id: header.stream_id,
-      payload_len: header.payload_len,
-      padding_len: pad_length.unwrap_or(0),
-      end: header.flags & 0x1 != 0,
-    }))
-  )
+  let (remaining, i) = take!(input, header.payload_len)?;
+
+  let (i1, pad_length) = cond!(i, header.flags & 0x8 != 0, be_u8)?;
+
+  if pad_length.is_some() && i1.len() <= pad_length.unwrap() as usize {
+    return Err(Err::Failure(error_position!(input, ErrorKind::Custom(PROTOCOL_ERROR))));
+  }
+
+  let (_, payload) = take!(i1, i1.len() - pad_length.unwrap_or(0) as usize)?;
+
+  Ok((remaining, Frame::Data(Data {
+    stream_id: header.stream_id,
+    payload,
+    end_stream: header.flags & 0x1 != 0
+  })))
 }
 
 #[derive(Clone,Debug,PartialEq)]
@@ -204,7 +209,7 @@ pub fn headers_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<
   )?;
   let(i3, weight) = cond!(i2, header.flags & 0x20 != 0, be_u8)?;
 
-  if pad_length.is_some() && i3.len() < pad_length.unwrap() as usize {
+  if pad_length.is_some() && i3.len() <= pad_length.unwrap() as usize {
     return Err(Err::Failure(error_position!(input, ErrorKind::Custom(PROTOCOL_ERROR))));
   }
 
