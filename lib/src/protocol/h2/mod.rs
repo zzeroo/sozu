@@ -193,10 +193,10 @@ impl<Front:SocketHandler> Http2<Front> {
   pub fn readable_parse(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     let mut state = self.state.take().unwrap();
     let (sz, cont) = {
-      state.parse_and_handle_front(self.frontend.read_buffer.data())
+      state.parse_and_handle(self.frontend.read_buffer.data())
     };
     self.frontend.read_buffer.consume(sz);
-    self.frontend.readiness.interest = state.front_interest;
+    self.frontend.readiness.interest = state.interest;
     self.state = Some(state);
     if cont {
       SessionResult::Continue
@@ -233,7 +233,7 @@ impl<Front:SocketHandler> Http2<Front> {
 
     let mut state = self.state.take().unwrap();
     //FIXME: do that in a loop until no more frames or WouldBlock
-    match state.gen_front(self.frontend.write_buffer.space()) {
+    match state.gen(self.frontend.write_buffer.space()) {
       Ok(sz) => {
         self.frontend.write_buffer.fill(sz);
         //FIXME: use real condition here to indicate there was nothing to write
@@ -248,7 +248,7 @@ impl<Front:SocketHandler> Http2<Front> {
       }
     }
 
-    self.frontend.readiness.interest = state.front_interest;
+    self.frontend.readiness.interest = state.interest;
 
     let res = self.frontend.write(metrics);
     match res {

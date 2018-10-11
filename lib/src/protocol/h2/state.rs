@@ -21,9 +21,9 @@ pub enum St {
 
 #[derive(Clone,Debug,PartialEq)]
 pub struct State {
-  pub front_output: VecDeque<OutputFrame>,
+  pub output: VecDeque<OutputFrame>,
   pub state: St,
-  pub front_interest: UnixReady,
+  pub interest: UnixReady,
   //FIXME: make it configurable,
   pub max_frame_size: u32,
 }
@@ -31,14 +31,14 @@ pub struct State {
 impl State {
   pub fn new() -> State {
     State {
-      front_output: VecDeque::new(),
+      output: VecDeque::new(),
       state: St::Init,
-      front_interest: UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
+      interest: UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
       max_frame_size: 16384,
     }
   }
 
-  pub fn parse_front<'a>(&mut self, mut input: &'a [u8]) -> (usize, Result<parser::Frame<'a>, ()>) {
+  pub fn parse<'a>(&mut self, mut input: &'a [u8]) -> (usize, Result<parser::Frame<'a>, ()>) {
     let mut consumed = 0usize;
 
     if self.state == St::Init {
@@ -68,7 +68,7 @@ impl State {
     }
   }
 
-  pub fn handle_front(&mut self, frame: &parser::Frame) -> bool {
+  pub fn handle(&mut self, frame: &parser::Frame) -> bool {
     match self.state {
       St::Init => true,
       St::ClientPrefaceReceived => {
@@ -85,9 +85,9 @@ impl State {
               payload: None,
             };
 
-            self.front_output.push_back(server_settings);
+            self.output.push_back(server_settings);
             self.state = St::ServerPrefaceSent;
-            self.front_interest.insert(UnixReady::from(Ready::writable()));
+            self.interest.insert(UnixReady::from(Ready::writable()));
             true
           },
           f => {
@@ -123,8 +123,8 @@ impl State {
     }
   }
 
-  pub fn parse_and_handle_front<'a>(&mut self, mut input: &'a [u8]) -> (usize, bool) {
-    let (sz, res) = self.parse_front(input);
+  pub fn parse_and_handle<'a>(&mut self, mut input: &'a [u8]) -> (usize, bool) {
+    let (sz, res) = self.parse(input);
     match res {
       Err(e) => {
         error!("error parsing frame: {:?}", e);
@@ -132,13 +132,13 @@ impl State {
       },
       Ok(frame) => {
         info!("parsed frame: {:?}", frame);
-        (sz, self.handle_front(&frame))
+        (sz, self.handle(&frame))
       }
     }
   }
 
-  pub fn gen_front(&mut self, mut output: &mut [u8]) -> Result<usize, ()> {
-    if let Some(frame) = self.front_output.pop_front() {
+  pub fn gen(&mut self, mut output: &mut [u8]) -> Result<usize, ()> {
+    if let Some(frame) = self.output.pop_front() {
       match serializer::gen_frame_header((output, 0), &frame.header) {
         Err(e) => {
           panic!("error serializing: {:?}", e);
@@ -148,7 +148,7 @@ impl State {
         }
       }
     } else {
-      self.front_interest.remove(Ready::writable());
+      self.interest.remove(Ready::writable());
       Ok(0)
     }
   }
