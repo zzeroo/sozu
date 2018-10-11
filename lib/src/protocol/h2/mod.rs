@@ -192,30 +192,17 @@ impl<Front:SocketHandler> Http2<Front> {
 
   pub fn readable_parse(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     let mut state = self.state.take().unwrap();
-    let (sz, res) = {
-      state.parse_front(self.frontend.read_buffer.data())
+    let (sz, cont) = {
+      state.parse_and_handle_front(self.frontend.read_buffer.data())
     };
     self.frontend.read_buffer.consume(sz);
-    info!("parsed: {:?}", res);
-
-    match res {
-      Err(e) => {
-        error!("error parsing frame: {:?}", e);
-        self.state = Some(state);
-        SessionResult::CloseSession
-      },
-      Ok(frame) => {
-        if state.handle_front(&frame) {
-          self.frontend.readiness.interest = state.front_interest;
-          self.state = Some(state);
-          SessionResult::Continue
-        } else {
-          self.state = Some(state);
-          SessionResult::CloseSession
-        }
-      }
+    self.frontend.readiness.interest = state.front_interest;
+    self.state = Some(state);
+    if cont {
+      SessionResult::Continue
+    } else {
+      SessionResult::CloseSession
     }
-
 
     /*let is_initial = unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial);
     // if there's no host, continue parsing until we find it

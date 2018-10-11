@@ -5,7 +5,7 @@ use mio::Ready;
 use mio::unix::UnixReady;
 
 #[derive(Clone,Debug,PartialEq)]
-pub struct Frame {
+pub struct OutputFrame {
   header: parser::FrameHeader,
   payload: Option<Vec<u8>>,
 }
@@ -19,7 +19,7 @@ pub enum St {
 
 #[derive(Clone,Debug,PartialEq)]
 pub struct State {
-  pub front_output: VecDeque<Frame>,
+  pub front_output: VecDeque<OutputFrame>,
   pub state: St,
   pub front_interest: UnixReady,
   //FIXME: make it configurable,
@@ -36,7 +36,7 @@ impl State {
     }
   }
 
-  pub fn parse_front(&mut self, mut input: &[u8]) -> (usize, Result<parser::FrameHeader, ()>) {
+  pub fn parse_front<'a>(&mut self, mut input: &'a [u8]) -> (usize, Result<parser::Frame<'a>, ()>) {
     let mut consumed = 0usize;
 
     if self.state == St::Init {
@@ -66,28 +66,31 @@ impl State {
     }
   }
 
-  pub fn handle_front(&mut self, frame: &parser::FrameHeader) -> bool {
+  pub fn handle_front(&mut self, frame: &parser::Frame) -> bool {
     match self.state {
       St::Init => true,
       St::ClientPrefaceReceived => {
-        if frame.frame_type != parser::FrameType::Settings {
-          panic!("invalid frame type");
-        } else {
-          let server_settings = Frame {
-            header: parser::FrameHeader {
-              payload_len: 0,
-              frame_type: parser::FrameType::Settings,
-              //FIXME: setting 1 for ACK?
-              flags: 1,
-              stream_id: 0,
-            },
-            payload: None,
-          };
+        match frame {
+          parser::Frame::Settings(s) => {
+            let server_settings = OutputFrame {
+              header: parser::FrameHeader {
+                payload_len: 0,
+                frame_type: parser::FrameType::Settings,
+                //FIXME: setting 1 for ACK?
+                flags: 1,
+                stream_id: 0,
+              },
+              payload: None,
+            };
 
-          self.front_output.push_back(server_settings);
-          self.state = St::ServerPrefaceSent;
-          self.front_interest.insert(UnixReady::from(Ready::writable()));
-          true
+            self.front_output.push_back(server_settings);
+            self.state = St::ServerPrefaceSent;
+            self.front_interest.insert(UnixReady::from(Ready::writable()));
+            true
+          },
+          f => {
+            unimplemented!("invalid frame: {:?}, should send back an error", f);
+          }
         }
       },
       St::ServerPrefaceSent => {
@@ -96,6 +99,19 @@ impl State {
     }
   }
 
+  pub fn parse_and_handle_front<'a>(&mut self, mut input: &'a [u8]) -> (usize, bool) {
+    let (sz, res) = self.parse_front(input);
+    match res {
+      Err(e) => {
+        error!("error parsing frame: {:?}", e);
+        (sz, false)
+      },
+      Ok(frame) => {
+        info!("parsed frame: {:?}", frame);
+        (sz, self.handle_front(&frame))
+      }
+    }
+  }
 
   pub fn gen_front(&mut self, mut output: &mut [u8]) -> Result<usize, ()> {
     if let Some(frame) = self.front_output.pop_front() {

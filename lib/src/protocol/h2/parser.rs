@@ -1,4 +1,4 @@
-use nom::{Err, ErrorKind, HexDisplay, IResult, Offset, be_u8, be_u24, be_u32};
+use nom::{Err, ErrorKind, HexDisplay, IResult, Offset, be_u8, be_u16, be_u24, be_u32};
 
 #[derive(Clone,Debug,PartialEq)]
 pub struct FrameHeader {
@@ -69,12 +69,12 @@ fn convert_frame_type(t: u8) -> Option<FrameType> {
 }
 
 #[derive(Clone,Debug,PartialEq)]
-pub enum Frame {
+pub enum Frame<'a> {
   Data(Data),
-  Headers,
+  Headers(Headers<'a>),
   Priority,
   RstStream(RstStream),
-  Settings,
+  Settings(Settings),
   PushPromise,
   Ping(Ping),
   GoAway,
@@ -82,8 +82,10 @@ pub enum Frame {
   Continuation,
 }
 
-pub fn frame(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHeader> {
+pub fn frame<'a>(input: &'a[u8], max_frame_size: u32) -> IResult<&'a[u8], Frame<'a>> {
   let (i,header) = frame_header(input)?;
+
+  info!("got frame header: {:?}", header);
 
   if header.payload_len > max_frame_size {
     return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
@@ -103,10 +105,10 @@ pub fn frame(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHeader> {
 
   let f = match header.frame_type {
     FrameType::Data => {
-      data_frame(i, &header)
+      data_frame(i, &header)?
     },
     FrameType::Headers => {
-      unimplemented!();
+      headers_frame(i, &header)?
     },
     FrameType::Priority => {
       if header.payload_len != 5 {
@@ -118,7 +120,7 @@ pub fn frame(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHeader> {
       if header.payload_len != 4 {
         return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
       }
-      rst_stream_frame(i, &header)
+      rst_stream_frame(i, &header)?
     },
     FrameType::PushPromise => {
       unimplemented!();
@@ -130,13 +132,13 @@ pub fn frame(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHeader> {
       if header.payload_len % 6 != 0 {
         return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
       }
-      unimplemented!();
+      settings_frame(i, &header)?
     },
     FrameType::Ping => {
       if header.payload_len != 8 {
         return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
       }
-      ping_frame(i, &header)
+      ping_frame(i, &header)?
     },
     FrameType::GoAway => {
       unimplemented!();
@@ -145,11 +147,11 @@ pub fn frame(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHeader> {
       if header.payload_len != 4 {
         return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
       }
-      window_update_frame(i, &header)
+      window_update_frame(i, &header)?
     }
   };
 
-  Ok((i, header))
+  Ok(f)
 }
 
 #[derive(Clone,Debug,PartialEq)]
@@ -160,7 +162,7 @@ pub struct Data {
   pub end: bool,
 }
 
-pub fn data_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame> {
+pub fn data_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
   do_parse!(input,
     pad_length: cond!(header.flags & 0x8 != 0, be_u8) >>
     (Frame::Data(Data {
@@ -173,11 +175,62 @@ pub fn data_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a
 }
 
 #[derive(Clone,Debug,PartialEq)]
+pub struct Headers<'a> {
+  pub stream_id: u32,
+  pub stream_dependency: Option<StreamDependency>,
+  pub weight: Option<u8>,
+  pub header_block_fragment: &'a[u8],
+  pub end_stream: bool,
+  pub end_headers: bool,
+  pub priority: bool,
+}
+
+#[derive(Clone,Debug,PartialEq)]
+pub struct StreamDependency {
+  pub exclusive: bool,
+  pub stream_id: u32,
+}
+
+pub fn headers_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
+  let (remaining, i) = take!(input, header.payload_len)?;
+
+  let (i1, pad_length) = cond!(i, header.flags & 0x8 != 0, be_u8)?;
+  let (i2, stream_dependency) = cond!(i1,
+    header.flags & 0x20 != 0,
+    map!(be_u32, |i| StreamDependency {
+      exclusive: i & 0x8000 != 0,
+      stream_id: i & 0x7FFF
+    })
+  )?;
+  let(i3, weight) = cond!(i2, header.flags & 0x20 != 0, be_u8)?;
+
+  if pad_length.is_some() && i3.len() < pad_length.unwrap() as usize {
+    return Err(Err::Failure(error_position!(input, ErrorKind::Custom(PROTOCOL_ERROR))));
+  }
+
+  let (_, header_block_fragment) = take!(i3, i3.len() - pad_length.unwrap_or(0) as usize)?;
+
+  Ok((
+    remaining,
+    Frame::Headers(Headers {
+      stream_id: header.stream_id,
+      stream_dependency,
+      weight,
+      header_block_fragment,
+      end_stream: header.flags & 0x1 != 0,
+      end_headers: header.flags & 0x4 != 0,
+      priority: header.flags & 0x20 != 0,
+    })
+  ))
+}
+
+
+#[derive(Clone,Debug,PartialEq)]
 pub struct RstStream {
   pub error_code: u32,
 }
 
-pub fn rst_stream_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame> {
+pub fn rst_stream_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
   map!(input,
     be_u32,
     |error_code| {
@@ -186,11 +239,40 @@ pub fn rst_stream_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResu
 }
 
 #[derive(Clone,Debug,PartialEq)]
+pub struct Settings {
+  pub settings: Vec<Setting>,
+}
+
+#[derive(Clone,Debug,PartialEq)]
+pub struct Setting {
+  pub identifier: u16,
+  pub value: u32,
+}
+
+pub fn settings_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
+  flat_map!(input,
+    take!(header.payload_len),
+    map!(
+      many0!(
+        complete!(do_parse!(
+          identifier: be_u16 >>
+          value:      be_u32 >>
+          (Setting { identifier, value })
+        ))
+      ),
+      |settings| {
+        Frame::Settings(Settings { settings })
+      }
+    )
+  )
+}
+
+#[derive(Clone,Debug,PartialEq)]
 pub struct Ping {
   pub payload: [u8; 8],
 }
 
-pub fn ping_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame> {
+pub fn ping_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
   map!(input,
     take!(8),
     |data| {
@@ -212,7 +294,7 @@ pub struct WindowUpdate {
   pub increment: u32,
 }
 
-pub fn window_update_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame> {
+pub fn window_update_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
   let (i, increment) = be_u32(input)?;
   let increment = increment & 0x7FFF;
 
