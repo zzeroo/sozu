@@ -13,6 +13,14 @@ pub struct OutputFrame {
 }
 
 #[derive(Clone,Debug,PartialEq)]
+pub enum FrameResult {
+  Close,
+  Continue,
+  //parameter is the stream id
+  ConnectBackend(u32),
+}
+
+#[derive(Clone,Debug,PartialEq)]
 pub enum St {
   Init,
   ClientPrefaceReceived,
@@ -70,14 +78,14 @@ impl State {
     }
   }
 
-  pub fn handle(&mut self, frame: &parser::Frame) -> bool {
+  pub fn handle(&mut self, frame: &parser::Frame) -> FrameResult {
     let stream_id = frame.stream_id();
     if stream_id != 0 {
       return self.stream_handle(stream_id, frame);
     }
 
     match self.state {
-      St::Init => true,
+      St::Init => FrameResult::Continue,
       St::ClientPrefaceReceived => {
         match frame {
           parser::Frame::Settings(s) => {
@@ -95,7 +103,7 @@ impl State {
             self.output.push_back(server_settings);
             self.state = St::ServerPrefaceSent;
             self.interest.insert(UnixReady::from(Ready::writable()));
-            true
+            FrameResult::Continue
           },
           f => {
             unimplemented!("invalid frame: {:?}, should send back an error", f);
@@ -113,12 +121,12 @@ impl State {
     }
   }
 
-  pub fn parse_and_handle<'a>(&mut self, mut input: &'a [u8]) -> (usize, bool) {
+  pub fn parse_and_handle<'a>(&mut self, mut input: &'a [u8]) -> (usize, FrameResult) {
     let (sz, res) = self.parse(input);
     match res {
       Err(e) => {
         error!("error parsing frame: {:?}", e);
-        (sz, false)
+        (sz, FrameResult::Close)
       },
       Ok(frame) => {
         info!("parsed frame: {:?}", frame);
@@ -143,7 +151,7 @@ impl State {
     }
   }
 
-  pub fn stream_handle(&mut self, stream_id: u32, frame: &parser::Frame) -> bool {
+  pub fn stream_handle(&mut self, stream_id: u32, frame: &parser::Frame) -> FrameResult {
     assert!(stream_id != 0);
 
     self.streams.entry(stream_id).or_insert(stream::Stream::new(stream_id)).handle(frame)

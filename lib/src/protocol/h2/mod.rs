@@ -198,10 +198,11 @@ impl<Front:SocketHandler> Http2<Front> {
     self.frontend.read_buffer.consume(sz);
     self.frontend.readiness.interest = state.interest;
     self.state = Some(state);
-    if cont {
-      SessionResult::Continue
-    } else {
-      SessionResult::CloseSession
+
+    match cont {
+      state::FrameResult::Close => SessionResult::CloseSession,
+      state::FrameResult::Continue => SessionResult::Continue,
+      state::FrameResult::ConnectBackend(id) => SessionResult::ConnectBackend,
     }
 
     /*let is_initial = unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial);
