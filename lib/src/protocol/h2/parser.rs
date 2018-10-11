@@ -82,6 +82,30 @@ pub enum Frame<'a> {
   Continuation,
 }
 
+impl<'a> Frame<'a> {
+  pub fn is_stream_specific(&self) -> bool {
+    match self {
+      Frame::Data(_) | Frame::Headers(_) | Frame::Priority |
+        Frame::RstStream(_) | Frame::PushPromise | Frame::Continuation => true,
+      Frame::Settings(_) | Frame::Ping(_) | Frame::GoAway => false,
+      Frame::WindowUpdate(w) => w.stream_id != 0,
+    }
+  }
+
+  pub fn stream_id(&self) -> u32 {
+    match self {
+      Frame::Data(d) => d.stream_id,
+      Frame::Headers(h) => h.stream_id,
+      Frame::Priority => unimplemented!(),
+      Frame::RstStream(r) => r.stream_id,
+      Frame::PushPromise => unimplemented!(),
+      Frame::Continuation => unimplemented!(),
+      Frame::Settings(_) | Frame::Ping(_) | Frame::GoAway => 0,
+      Frame::WindowUpdate(w) => w.stream_id,
+    }
+  }
+}
+
 pub fn frame<'a>(input: &'a[u8], max_frame_size: u32) -> IResult<&'a[u8], Frame<'a>> {
   let (i,header) = frame_header(input)?;
 
@@ -232,6 +256,7 @@ pub fn headers_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<
 
 #[derive(Clone,Debug,PartialEq)]
 pub struct RstStream {
+  pub stream_id: u32,
   pub error_code: u32,
 }
 
@@ -239,7 +264,10 @@ pub fn rst_stream_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResu
   map!(input,
     be_u32,
     |error_code| {
-      Frame::RstStream(RstStream { error_code })
+      Frame::RstStream(RstStream {
+        stream_id: header.stream_id,
+        error_code
+      })
   })
 }
 
@@ -296,6 +324,7 @@ pub fn ping_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a
 
 #[derive(Clone,Debug,PartialEq)]
 pub struct WindowUpdate {
+  pub stream_id: u32,
   pub increment: u32,
 }
 
@@ -308,7 +337,10 @@ pub fn window_update_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IR
     return Err(Err::Failure(error_position!(input, ErrorKind::Custom(PROTOCOL_ERROR))));
   }
 
-  Ok((i, Frame::WindowUpdate(WindowUpdate { increment })))
+  Ok((i, Frame::WindowUpdate(WindowUpdate {
+    stream_id: header.stream_id,
+    increment
+  })))
 }
 
 #[macro_export]

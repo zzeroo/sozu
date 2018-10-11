@@ -1,10 +1,10 @@
 use super::{parser, serializer};
 use nom::Offset;
-use std::collections::VecDeque;
+use std::collections::{HashMap,VecDeque};
 use mio::Ready;
 use mio::unix::UnixReady;
-use hpack::Decoder;
-use std::str::from_utf8;
+
+use super::stream;
 
 #[derive(Clone,Debug,PartialEq)]
 pub struct OutputFrame {
@@ -26,6 +26,7 @@ pub struct State {
   pub interest: UnixReady,
   //FIXME: make it configurable,
   pub max_frame_size: u32,
+  pub streams: HashMap<u32, stream::Stream>,
 }
 
 impl State {
@@ -35,6 +36,7 @@ impl State {
       state: St::Init,
       interest: UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
       max_frame_size: 16384,
+      streams: HashMap::new(),
     }
   }
 
@@ -69,6 +71,11 @@ impl State {
   }
 
   pub fn handle(&mut self, frame: &parser::Frame) -> bool {
+    let stream_id = frame.stream_id();
+    if stream_id != 0 {
+      return self.stream_handle(stream_id, frame);
+    }
+
     match self.state {
       St::Init => true,
       St::ClientPrefaceReceived => {
@@ -97,23 +104,6 @@ impl State {
       },
       St::ServerPrefaceSent => {
         match frame {
-          parser::Frame::Headers(h) => {
-            let mut decoder = Decoder::new();
-            match decoder.decode(h.header_block_fragment) {
-              Err(e) => {
-                error!("error decoding headers: {:?}", e);
-              },
-              Ok(h) => {
-                info!("got header list: {:?}", h);
-                for header in &h {
-                  info!("{}: {}",
-                    from_utf8(&header.0).unwrap(), from_utf8(&header.1).unwrap());
-                }
-              }
-            };
-
-            false
-          },
           frame => {
             panic!("unknown frame for now: {:?}", frame);
           }
@@ -151,5 +141,11 @@ impl State {
       self.interest.remove(Ready::writable());
       Ok(0)
     }
+  }
+
+  pub fn stream_handle(&mut self, stream_id: u32, frame: &parser::Frame) -> bool {
+    assert!(stream_id != 0);
+
+    self.streams.entry(stream_id).or_insert(stream::Stream::new(stream_id)).handle(frame)
   }
 }

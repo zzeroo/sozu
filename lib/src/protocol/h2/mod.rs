@@ -1,4 +1,3 @@
-use std::cmp::min;
 use std::net::{SocketAddr,IpAddr};
 use std::cell::RefCell;
 use std::rc::Weak;
@@ -14,6 +13,7 @@ use sozu_command::buffer::Buffer;
 
 mod parser;
 mod serializer;
+mod stream;
 mod state;
 
 type BackendToken = Token;
