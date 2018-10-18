@@ -6,7 +6,6 @@ use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use uuid::Uuid;
 use {SessionResult,Readiness,SessionMetrics,Protocol};
-use buffer_queue::BufferQueue;
 use socket::{SocketHandler,SocketResult};
 use pool::{Pool,Checkout};
 use sozu_command::buffer::Buffer;
@@ -29,24 +28,29 @@ pub struct Http2<Front:SocketHandler> {
   backend:             Option<TcpStream>,
   frontend_token:      Token,
   backend_token:       Option<Token>,
-  back_buf:            Option<Checkout<BufferQueue>>,
+  back_buf:            Option<Checkout<Buffer>>,
   pub app_id:          Option<String>,
   pub request_id:      String,
   pub back_readiness:  Readiness,
   pub log_ctx:         String,
   public_address:      Option<IpAddr>,
   pub state:           Option<state::State>,
-  pool:                Weak<RefCell<Pool<BufferQueue>>>,
+  pool:                Weak<RefCell<Pool<Buffer>>>,
 }
 
 impl<Front:SocketHandler> Http2<Front> {
-  pub fn new(frontend: Front, frontend_token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
+  pub fn new(frontend: Front, frontend_token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
   public_address: Option<IpAddr>, client_address: Option<SocketAddr>, sticky_name: String,
   protocol: Protocol) -> Http2<Front> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\tunknown\t", &request_id);
+    let (read, write) = {
+      let p = pool.upgrade().unwrap();
+      let res = (p.borrow_mut().checkout().unwrap(), p.borrow_mut().checkout().unwrap());
+      res
+    };
     let session = Http2 {
-      frontend: Connection::new(frontend),
+      frontend: Connection::new(frontend, read, write),
       frontend_token,
       backend:            None,
       backend_token:      None,
@@ -392,12 +396,12 @@ impl<Front:SocketHandler> Http2<Front> {
 pub struct Connection<Socket:SocketHandler> {
   pub socket: Socket,
   pub readiness: Readiness,
-  pub read_buffer: Buffer,
-  pub write_buffer: Buffer,
+  pub read_buffer: Checkout<Buffer>,
+  pub write_buffer: Checkout<Buffer>,
 }
 
 impl<Socket:SocketHandler> Connection<Socket> {
-  pub fn new(socket: Socket) -> Self {
+  pub fn new(socket: Socket, read_buffer: Checkout<Buffer>, write_buffer: Checkout<Buffer>) -> Self {
     Connection {
       socket,
       readiness: Readiness {
@@ -405,9 +409,9 @@ impl<Socket:SocketHandler> Connection<Socket> {
         event: UnixReady::from(Ready::empty()),
       },
       //FIXME: capacity can be configured
-      read_buffer: Buffer::with_capacity(16384),
+      read_buffer,
       //FIXME: capacity can be configured
-      write_buffer: Buffer::with_capacity(16384),
+      write_buffer,
     }
   }
 
