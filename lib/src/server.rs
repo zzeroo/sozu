@@ -22,7 +22,7 @@ use sozu_command::buffer::Buffer;
 
 use {SessionResult,ConnectionError,Protocol,ProxySession,
   CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration,Backend};
-use {http,tcp};
+use {http,tcp,sni_router};
 use pool::Pool;
 use metrics::METRICS;
 use backends::BackendMap;
@@ -106,6 +106,7 @@ pub struct Server {
   http:            http::Proxy,
   https:           HttpsProvider,
   tcp:             tcp::Proxy,
+  sni_router:      sni_router::Proxy,
   config_state:    ConfigState,
   scm:             ScmSocket,
   sessions:        Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
@@ -153,7 +154,8 @@ impl Server {
     let https = HttpsProvider::new(use_openssl, pool.clone(), backends.clone());
 
     let server_config = ServerConfig::from_config(&config);
-    Server::new(event_loop, channel, scm, sessions, pool, backends, None, Some(https), None, server_config, Some(config_state))
+    Server::new(event_loop, channel, scm, sessions, pool, backends,
+      None, Some(https), None, None, server_config, Some(config_state))
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
@@ -163,6 +165,7 @@ impl Server {
     http: Option<http::Proxy>,
     https: Option<HttpsProvider>,
     tcp:  Option<tcp::Proxy>,
+    sni_router: Option<sni_router::Proxy>,
     server_config: ServerConfig,
     config_state: Option<ConfigState>) -> Self {
 
@@ -199,6 +202,7 @@ impl Server {
       http:            http.unwrap_or(http::Proxy::new(pool.clone(), backends.clone())),
       https:           https.unwrap_or(HttpsProvider::new(false, pool.clone(), backends.clone())),
       tcp:             tcp.unwrap_or(tcp::Proxy::new(backends.clone())),
+      sni_router:      sni_router.unwrap_or(sni_router::Proxy::new(backends.clone())),
       config_state:    ConfigState::new(),
       scm,
       sessions,

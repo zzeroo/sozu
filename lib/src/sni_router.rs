@@ -31,6 +31,7 @@ use protocol::{Pipe, ProtocolResult};
 use protocol::proxy_protocol::send::SendProxyProtocol;
 use protocol::proxy_protocol::relay::RelayProxyProtocol;
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use protocol::peek_sni::PeekSNI;
 use retry::RetryPolicy;
 
 use util::UnwrapLog;
@@ -43,9 +44,8 @@ pub enum UpgradeResult {
 
 pub enum State {
   Pipe(Pipe<TcpStream>),
-  SendProxyProtocol(SendProxyProtocol<TcpStream>),
-  RelayProxyProtocol(RelayProxyProtocol<TcpStream>),
   ExpectProxyProtocol(ExpectProxyProtocol<TcpStream>),
+  PeekSNI(PeekSNI),
 }
 
 pub struct Session {
@@ -68,34 +68,21 @@ pub struct Session {
 
 impl Session {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<Buffer>,
-    back_buf: Checkout<Buffer>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
+    back_buf: Checkout<Buffer>, expect_proxy: bool, timeout: Timeout) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.peer_addr().map(|s| s.ip()).ok();
     let mut frontend_buffer = None;
     let mut backend_buffer = None;
 
-      let protocol = match proxy_protocol {
-      Some(ProxyProtocolConfig::RelayHeader) => {
-        backend_buffer = Some(back_buf);
-        gauge_add!("protocol.proxy.relay", 1);
-        Some(State::RelayProxyProtocol(RelayProxyProtocol::new(s, frontend_token, None, front_buf)))
-      },
-      Some(ProxyProtocolConfig::ExpectHeader) => {
-        frontend_buffer = Some(front_buf);
-        backend_buffer = Some(back_buf);
-        gauge_add!("protocol.proxy.expect", 1);
-        Some(State::ExpectProxyProtocol(ExpectProxyProtocol::new(s, frontend_token)))
-      },
-      Some(ProxyProtocolConfig::SendHeader) => {
-        frontend_buffer = Some(front_buf);
-        backend_buffer = Some(back_buf);
-        gauge_add!("protocol.proxy.send", 1);
-        Some(State::SendProxyProtocol(SendProxyProtocol::new(s, frontend_token, None)))
-      },
-      None => {
-        gauge_add!("protocol.tcp", 1);
-        Some(State::Pipe(Pipe::new(s, frontend_token, None, front_buf, back_buf, addr)))
-      }
+    let protocol = if expect_proxy {
+      frontend_buffer = Some(front_buf);
+      backend_buffer = Some(back_buf);
+      gauge_add!("protocol.proxy.expect", 1);
+      Some(State::ExpectProxyProtocol(ExpectProxyProtocol::new(s, frontend_token)))
+    } else {
+      backend_buffer = Some(back_buf);
+      gauge_add!("protocol.proxy.peek_sni", 1);
+      Some(State::PeekSNI(PeekSNI::new(s, frontend_token, front_buf)))
     };
 
     Session {
@@ -177,27 +164,24 @@ impl Session {
   }
 
   fn readable(&mut self) -> SessionResult {
-    let mut should_upgrade_protocol = ProtocolResult::Continue;
+    //let mut should_upgrade_protocol = ProtocolResult::Continue;
 
     let res = match self.protocol {
-      Some(State::Pipe(ref mut pipe)) => pipe.readable(&mut self.metrics),
-      Some(State::RelayProxyProtocol(ref mut pp)) => pp.readable(&mut self.metrics),
+      Some(State::PeekSNI(ref mut peek)) => peek.readable(),
       Some(State::ExpectProxyProtocol(ref mut pp)) => {
-        let res = pp.readable(&mut self.metrics);
-        should_upgrade_protocol = res.0;
-        res.1
+        pp.readable(&mut self.metrics)
       },
-      _ => SessionResult::Continue,
+      _ => (ProtocolResult::Continue, SessionResult::CloseSession),
     };
 
-    if let ProtocolResult::Upgrade = should_upgrade_protocol {
+    if let ProtocolResult::Upgrade = res.0 {
       match self.upgrade() {
         UpgradeResult::Continue => SessionResult::Continue,
         UpgradeResult::Close    => SessionResult::CloseSession,
         UpgradeResult::ConnectBackend => SessionResult::ConnectBackend,
       }
     } else {
-      res
+      res.1
     }
   }
 
@@ -220,12 +204,6 @@ impl Session {
 
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => res.1 = pipe.back_writable(&mut self.metrics),
-      Some(State::RelayProxyProtocol(ref mut pp)) => {
-        res = pp.back_writable(&mut self.metrics);
-      },
-      Some(State::SendProxyProtocol(ref mut pp)) => {
-        res = pp.back_writable(&mut self.metrics);
-      }
       _ => unreachable!(),
     };
 
@@ -239,8 +217,7 @@ impl Session {
   fn front_socket(&self) -> &TcpStream {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.front_socket(),
-      Some(State::SendProxyProtocol(ref pp)) => pp.front_socket(),
-      Some(State::RelayProxyProtocol(ref pp)) => pp.front_socket(),
+      Some(State::PeekSNI(ref peek)) => peek.front_socket(),
       Some(State::ExpectProxyProtocol(ref pp)) => pp.front_socket(),
       _ => unreachable!(),
     }
@@ -249,8 +226,7 @@ impl Session {
   fn back_socket(&self)  -> Option<&TcpStream> {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.back_socket(),
-      Some(State::SendProxyProtocol(ref pp)) => pp.back_socket(),
-      Some(State::RelayProxyProtocol(ref pp)) => pp.back_socket(),
+      Some(State::PeekSNI(_)) => None,
       Some(State::ExpectProxyProtocol(_)) => None,
       _ => unreachable!(),
     }
@@ -259,38 +235,27 @@ impl Session {
   pub fn upgrade(&mut self) -> UpgradeResult {
     let protocol = self.protocol.take();
 
-    if let Some(State::SendProxyProtocol(pp)) = protocol {
-      if self.back_buf.is_some() && self.front_buf.is_some() {
+    if let Some(State::PeekSNI(peek)) = protocol {
+      if self.back_buf.is_some() {
+        let PeekSNI { stream, token, buffer, sni_list, readiness } = peek;
         self.protocol = Some(
-          State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap()))
+          State::Pipe(Pipe::new(stream, token, None, buffer, self.back_buf.take().unwrap(), None))
         );
-        gauge_add!("protocol.proxy.send", -1);
+        gauge_add!("protocol.peek_sni", -1);
         gauge_add!("protocol.tcp", 1);
-        UpgradeResult::Continue
+        UpgradeResult::ConnectBackend
       } else {
         error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
-        UpgradeResult::Close
-      }
-    } else if let Some(State::RelayProxyProtocol(mut pp)) = protocol {
-      if self.back_buf.is_some() {
-        self.protocol = Some(
-          State::Pipe(pp.into_pipe(self.back_buf.take().unwrap()))
-        );
-        gauge_add!("protocol.proxy.relay", -1);
-        gauge_add!("protocol.tcp", 1);
-        UpgradeResult::Continue
-      } else {
-        error!("Missing the backend buffer queue, we can't switch to a pipe");
         UpgradeResult::Close
       }
     } else if let Some(State::ExpectProxyProtocol(mut pp)) = protocol {
       if self.front_buf.is_some() && self.back_buf.is_some() {
         self.protocol = Some(
-          State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap(), None, None))
+          State::PeekSNI(PeekSNI::new(pp.frontend, pp.frontend_token, self.front_buf.take().unwrap()))
         );
         gauge_add!("protocol.proxy.expect", -1);
-        gauge_add!("protocol.tcp", 1);
-        UpgradeResult::ConnectBackend
+        gauge_add!("protocol.peek_sni", 1);
+        UpgradeResult::Continue
       } else {
         error!("Missing the backend buffer queue, we can't switch to a pipe");
         UpgradeResult::Close
@@ -303,8 +268,7 @@ impl Session {
   fn front_readiness(&mut self) -> &mut Readiness {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.front_readiness(),
-      Some(State::SendProxyProtocol(ref mut pp)) => pp.front_readiness(),
-      Some(State::RelayProxyProtocol(ref mut pp)) => pp.front_readiness(),
+      Some(State::PeekSNI(ref mut peek)) => peek.readiness(),
       Some(State::ExpectProxyProtocol(ref mut pp)) => pp.readiness(),
       _ => unreachable!(),
     }
@@ -313,8 +277,6 @@ impl Session {
   fn back_readiness(&mut self) -> Option<&mut Readiness> {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => Some(pipe.back_readiness()),
-      Some(State::SendProxyProtocol(ref mut pp)) => Some(pp.back_readiness()),
-      Some(State::RelayProxyProtocol(ref mut pp)) => Some(pp.back_readiness()),
       _ => None,
     }
   }
@@ -322,8 +284,7 @@ impl Session {
   fn back_token(&self)   -> Option<Token> {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.back_token(),
-      Some(State::SendProxyProtocol(ref pp)) => pp.back_token(),
-      Some(State::RelayProxyProtocol(ref pp)) => pp.back_token(),
+      Some(State::PeekSNI(_)) => None,
       Some(State::ExpectProxyProtocol(_)) => None,
       _ => unreachable!()
     }
@@ -332,8 +293,7 @@ impl Session {
   fn set_back_socket(&mut self, socket: TcpStream) {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
-      Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
-      Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
+      Some(State::PeekSNI(_)) => panic!("we should not set the back socket for the PeekSNI protocol"),
       Some(State::ExpectProxyProtocol(_)) => panic!("we should not set the back socket for the expect proxy protocol"),
       _ => unreachable!()
     }
@@ -344,8 +304,7 @@ impl Session {
 
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.set_back_token(token),
-      Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_token(token),
-      Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_token(token),
+      Some(State::PeekSNI(_)) => self.backend_token = Some(token),
       Some(State::ExpectProxyProtocol(_)) => self.backend_token = Some(token),
       _ => unreachable!()
     }
@@ -359,9 +318,6 @@ impl Session {
     self.back_connected = status;
     if status == BackendConnectionStatus::Connected {
       gauge_add!("backend.connections", 1);
-      if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
-        pp.set_back_connected(BackendConnectionStatus::Connected);
-      }
 
       self.backend.as_ref().map(|backend| {
         let ref mut backend = *backend.borrow_mut();
@@ -427,8 +383,7 @@ impl ProxySession for Session {
 
     match self.protocol {
       Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
-      Some(State::SendProxyProtocol(_)) => gauge_add!("protocol.proxy.send", -1),
-      Some(State::RelayProxyProtocol(_)) => gauge_add!("protocol.proxy.relay", -1),
+      Some(State::PeekSNI(_)) => gauge_add!("protocol.peek_sni", -1),
       Some(State::ExpectProxyProtocol(_)) => gauge_add!("protocol.proxy.expect", -1),
       None => {},
     }
@@ -631,22 +586,18 @@ impl ProxySession for Session {
   fn print_state(&self) {
     let p:String = match &self.protocol {
       Some(State::ExpectProxyProtocol(_)) => String::from("Expect"),
-      Some(State::SendProxyProtocol(_))   => String::from("Send"),
-      Some(State::RelayProxyProtocol(_))  => String::from("Relay"),
+      Some(State::PeekSNI(_))             => String::from("PeekSNI"),
       Some(State::Pipe(_))                => String::from("TCP"),
       None                                => String::from("None"),
     };
 
     let rf = match *unwrap_msg!(self.protocol.as_ref()) {
       State::ExpectProxyProtocol(ref expect) => &expect.readiness,
-      State::SendProxyProtocol(ref send)     => &send.front_readiness,
-      State::RelayProxyProtocol(ref relay)   => &relay.front_readiness,
+      State::PeekSNI(ref peek)               => &peek.readiness,
       State::Pipe(ref pipe)                  => &pipe.front_readiness,
     };
 
     let rb = match *unwrap_msg!(self.protocol.as_ref()) {
-      State::SendProxyProtocol(ref send)     => Some(&send.back_readiness),
-      State::RelayProxyProtocol(ref relay)   => Some(&relay.back_readiness),
       State::Pipe(ref pipe)                  => Some(&pipe.back_readiness),
       _ => None,
     };
@@ -939,12 +890,13 @@ impl ProxyConfiguration<Session> for Proxy {
         let proxy_protocol = self.configs
                                 .get(listener.app_id.as_ref().unwrap())
                                 .and_then(|c| c.proxy_protocol.clone());
+        let is_expect = proxy_protocol == Some(ProxyProtocolConfig::ExpectHeader);
 
         if let Err(e) = frontend_sock.set_nodelay(true) {
           error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
         }
-        let c = Session::new(frontend_sock, session_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
-        timeout);
+        let c = Session::new(frontend_sock, session_token, internal_token, front_buf, back_buf,
+          is_expect, timeout);
         incr!("tcp.requests");
 
         if let Err(e) = poll.register(
@@ -956,8 +908,7 @@ impl ProxyConfiguration<Session> for Proxy {
           error!("error registering front socket({:?}): {:?}", c.front_socket(), e);
         }
 
-        let should_connect_backend = proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
-        Ok((Rc::new(RefCell::new(c)), should_connect_backend))
+        Ok((Rc::new(RefCell::new(c)), false))
       } else {
         error!("could not get buffers from pool");
         Err(AcceptError::TooManySessions)
@@ -1017,7 +968,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   let mut server_config: server::ServerConfig = Default::default();
   server_config.max_connections = max_buffers;
   let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), sessions,
-    pool, backends, None ,None, Some(configuration), None, server_config, None);
+    pool, backends, None, None, None, Some(configuration), server_config, None);
 
   info!("starting event loop");
   server.run();
@@ -1180,7 +1131,7 @@ mod tests {
       let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.into_raw_fd()),
-        sessions, pool, backends, None, None, Some(configuration), None, server_config, None);
+        sessions, pool, backends, None, None, None, Some(configuration), server_config, None);
       info!("will run");
       s.run();
       info!("ending event loop");

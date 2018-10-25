@@ -12,7 +12,7 @@ use certificate::{calculate_fingerprint,split_certificate_chain};
 use toml;
 
 use proxy::{CertFingerprint,CertificateAndKey,ProxyRequestData,HttpFront,HttpsFront,TcpFront,Backend,
-  HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
+  HttpListener,HttpsListener,TcpListener,SniListener,AddCertificate,TlsProvider,LoadBalancingParams,
   Application, TlsVersion,ActivateListener,ListenerType};
 
 use command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
@@ -214,7 +214,37 @@ impl Listener {
         expect_proxy:   self.expect_proxy.unwrap_or(false),
       }
     })
+  }
 
+  pub fn to_sni(&self) -> Option<SniListener> {
+    if self.protocol != FileListenerProtocolConfig::SniRouter {
+      error!("cannot convert listener to SNI ");
+      return None;
+    }
+
+    /*FIXME
+    let mut address = self.address.clone();
+    address.push(':');
+    address.push_str(&self.port.to_string());
+
+    let http_proxy_configuration = match address.parse() {
+      Ok(addr) => Some(addr),
+      Err(err) => {
+        error!("Couldn't parse address of HTTP proxy: {}", err);
+        None
+      }
+    };
+    */
+    let public_address = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
+    let http_proxy_configuration = Some(self.address);
+
+    http_proxy_configuration.map(|addr| {
+      SniListener {
+        front:          addr,
+        public_address,
+        expect_proxy:   self.expect_proxy.unwrap_or(false),
+      }
+    })
   }
 }
 
@@ -299,6 +329,17 @@ impl FileAppFrontendConfig {
       certificate_chain: chain_opt,
     })
   }
+  
+  pub fn to_sni_front(&self, app_id: &str) -> Result<HttpSniConfig, String> {
+    if self.hostname.is_none() {
+      return Err(String::from("SNI frontend should have a 'hostname' field"));
+    }
+
+    Ok(SniFrontendConfig {
+      address:           self.address.clone(),
+      hostname:          self.hostname.clone().unwrap(),
+    })
+  }
 }
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -307,6 +348,7 @@ pub enum FileListenerProtocolConfig {
   Http,
   Https,
   Tcp,
+  SniRouter,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -314,6 +356,7 @@ pub enum FileListenerProtocolConfig {
 pub enum FileAppProtocolConfig {
   Http,
   Tcp,
+  Sni,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -452,6 +495,22 @@ impl FileAppConfig {
           https_redirect:    self.https_redirect.unwrap_or(false),
           load_balancing_policy: self.load_balancing_policy,
           answer_503,
+        }))
+      },
+      FileAppProtocolConfig::SniRouter => {
+        let mut frontends = Vec::new();
+        for f in self.frontends {
+          match f.to_sni_front(app_id) {
+            Ok(frontend) => frontends.push(frontend),
+            Err(e) => return Err(e),
+          }
+        }
+
+        Ok(AppConfig::Sni(SniAppConfig {
+          app_id:            app_id.to_string(),
+          frontends,
+          backends:          self.backends,
+          load_balancing_policy: self.load_balancing_policy,
         }))
       }
     }
@@ -727,6 +786,7 @@ impl FileConfig {
     let mut http_listeners = Vec::new();
     let mut https_listeners = Vec::new();
     let mut tcp_listeners = Vec::new();
+    let mut sni_listeners = Vec::new();
     let mut known_addresses = HashMap::new();
     let mut expect_proxy = HashSet::new();
 
@@ -763,6 +823,13 @@ impl FileConfig {
               panic!("invalid listener");
             }
           },
+          FileListenerProtocolConfig::SniRouter => {
+            if let Some(l) = listener.to_sni() {
+              sni_listeners.push(l);
+            } else {
+              panic!("invalid listener");
+            }
+          },
         }
       }
     }
@@ -790,6 +857,9 @@ impl FileConfig {
                         panic!("cannot set up a HTTP frontend on a HTTPS listener");
                       }
                     },
+                    Some(FileListenerProtocolConfig::SniRouter) => {
+                      panic!("cannot set up a HTTP or HTTPS frontend on a SNI router listener");
+                    },
                     None => {
                       // create a default listener for that front
                       let p = if frontend.certificate.is_some() {
@@ -812,8 +882,9 @@ impl FileConfig {
                 //FIXME: verify that different TCP apps do not request the same address
                 for frontend in &tcp.frontends {
                   match known_addresses.get(&frontend.address) {
-                    Some(FileListenerProtocolConfig::Http) | Some(FileListenerProtocolConfig::Https) => {
-                      panic!("cannot set up a TCP frontend on a HTTP listener");
+                    Some(FileListenerProtocolConfig::Http) | Some(FileListenerProtocolConfig::Https)
+                      | Some(FileListenerProtocolConfig::SniRouter) => {
+                      panic!("cannot set up a TCP frontend on a HTTP or SNI listener");
                     },
                     Some(FileListenerProtocolConfig::Tcp) => {},
                     None => {

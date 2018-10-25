@@ -201,6 +201,8 @@ pub mod https_openssl;
 
 pub mod https_rustls;
 
+pub mod sni_router;
+
 use mio::{Poll,Ready,Token};
 use mio::unix::UnixReady;
 use mio::net::TcpStream;

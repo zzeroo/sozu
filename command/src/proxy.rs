@@ -520,6 +520,24 @@ pub struct TcpListener {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct SniListener {
+    pub front:          SocketAddr,
+    pub public_address: Option<IpAddr>,
+    #[serde(default)]
+    pub expect_proxy:   bool,
+}
+
+impl Default for SniListener {
+  fn default() -> SniListener {
+    SniListener {
+      front:           "127.0.0.1:8080".parse().expect("could not parse address"),
+      public_address:  None,
+      expect_proxy:    false,
+    }
+  }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct QueryApplicationDomain {
   pub hostname: String,
   pub path_begin: Option<String>

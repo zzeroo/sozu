@@ -56,6 +56,7 @@ pub mod pipe;
 pub mod openssl;
 pub mod rustls;
 pub mod proxy_protocol;
+pub mod peek_sni;
 
 #[cfg(feature = "use-openssl")]
 pub use self::openssl::TlsHandshake;
