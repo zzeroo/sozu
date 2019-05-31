@@ -32,7 +32,7 @@ use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
 use http::{DefaultAnswers, CustomAnswers};
 use socket::server_bind;
-use trie::*;
+use router::trie::*;
 use protocol::StickySession;
 use protocol::http::DefaultAnswerStatus;
 use util::UnwrapLog;

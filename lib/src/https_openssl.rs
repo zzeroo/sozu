@@ -43,7 +43,7 @@ use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
   ListenSession, CONN_RETRIES, push_event};
 use http::{DefaultAnswers, CustomAnswers};
 use socket::server_bind;
-use trie::*;
+use router::trie::*;
 use protocol::{ProtocolResult,Http,Pipe,StickySession};
 use protocol::openssl::TlsHandshake;
 use protocol::http::DefaultAnswerStatus;
