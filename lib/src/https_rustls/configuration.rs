@@ -32,7 +32,7 @@ use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
 use http::{DefaultAnswers, CustomAnswers};
 use socket::server_bind;
-use router::trie::*;
+use router::{Router, trie::*};
 use protocol::StickySession;
 use protocol::http::DefaultAnswerStatus;
 use util::UnwrapLog;
@@ -53,7 +53,7 @@ pub type PathBegin = String;
 pub struct Listener {
   listener:   Option<TcpListener>,
   address:    SocketAddr,
-  fronts:     TrieNode<Vec<TlsApp>>,
+  fronts:     Router,
   answers:    DefaultAnswers,
   config:     HttpsListener,
   ssl_config: Arc<ServerConfig>,
@@ -111,7 +111,7 @@ impl Listener {
 
     Listener {
       address:    config.front.clone(),
-      fronts:     TrieNode::root(),
+      fronts:     Router::new(),
       answers:    default,
       ssl_config: Arc::new(server_config),
       listener: None,
@@ -146,48 +146,12 @@ impl Listener {
   }
 
   pub fn add_https_front(&mut self, tls_front: HttpFront) -> bool {
-    //FIXME: should clone he hostname then do a into() here
-    let app = TlsApp {
-      app_id:           tls_front.app_id.clone(),
-      hostname:         tls_front.hostname.clone(),
-      path_begin:       tls_front.path_begin.clone(),
-    };
-
-    if let Some((_,fronts)) = self.fronts.domain_lookup_mut(&tls_front.hostname.as_bytes()) {
-        if ! fronts.contains(&app) {
-          fronts.push(app.clone());
-        }
-    }
-    if self.fronts.domain_lookup(&tls_front.hostname.as_bytes()).is_none() {
-      self.fronts.domain_insert(tls_front.hostname.into_bytes(), vec![app]);
-    }
-
-    true
+    self.fronts.add_http_front(tls_front)
   }
 
-  pub fn remove_https_front(&mut self, front: HttpFront) {
-    debug!("removing tls_front {:?}", front);
-
-    let should_delete = {
-      let fronts_opt = self.fronts.domain_lookup_mut(front.hostname.as_bytes());
-      if let Some((_, fronts)) = fronts_opt {
-        if let Some(pos) = fronts.iter()
-          .position(|f| {
-            f.app_id == front.app_id &&
-            f.hostname == front.hostname &&
-            f.path_begin == front.path_begin
-          }) {
-
-          let front = fronts.remove(pos);
-        }
-      }
-
-      fronts_opt.as_ref().map(|(_,fronts)| fronts.is_empty()).unwrap_or(false)
-    };
-
-    if should_delete {
-      self.fronts.domain_remove(&front.hostname.into());
-    }
+  pub fn remove_https_front(&mut self, tls_front: HttpFront) -> bool {
+    debug!("removing tls_front {:?}", tls_front);
+    self.fronts.remove_http_front(tls_front)
   }
 
   pub fn add_certificate(&mut self, add_certificate: AddCertificate) -> bool {
@@ -237,7 +201,7 @@ impl Listener {
   }
 
   // ToDo factor out with http.rs
-  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&TlsApp> {
+  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<String> {
     let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
@@ -253,25 +217,7 @@ impl Listener {
       return None;
     };
 
-    if let Some((_,http_fronts)) = self.fronts.domain_lookup(host.as_bytes()) {
-      let matching_fronts = http_fronts.iter().filter(|f| uri.starts_with(&f.path_begin)); // ToDo match on uri
-      let mut front = None;
-
-      for f in matching_fronts {
-        if front.is_none() {
-          front = Some(f);
-        }
-
-        if let Some(ff) = front {
-          if f.path_begin.len() > ff.path_begin.len() {
-            front = Some(f)
-          }
-        }
-      }
-      front
-    } else {
-      None
-    }
+    self.fronts.lookup(host.as_bytes(), uri.as_bytes())
   }
 
 }
@@ -419,8 +365,7 @@ impl Proxy {
       .and_then(|h| h.request.as_ref()).and_then(|r| r.get_request_line())
       .ok_or(ConnectionError::NoRequestLineGiven)?;
     match self.listeners.get(&session.listen_token).as_ref()
-      .and_then(|l| l.frontend_from_request(&host, &rl.uri))
-      .map(|ref front| front.app_id.clone()) {
+      .and_then(|l| l.frontend_from_request(&host, &rl.uri)) {
       Some(app_id) => Ok(app_id),
       None => {
         let answer = self.listeners[&session.listen_token].answers.NotFound.clone();
