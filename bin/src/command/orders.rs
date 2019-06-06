@@ -589,7 +589,7 @@ impl CommandServer {
           error!("metrics error: {}", e);
         }));
       },
-      &Query::Certificates(ref query_type) => {
+      &Query::Certificates(ref _query_type) => {
         executor::Executor::execute(f.map(move |data| {
           info!("certificates query received: {:?}", data);
 

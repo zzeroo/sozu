@@ -25,6 +25,8 @@ use retry::RetryPolicy;
 use util::UnwrapLog;
 use buffer_queue::BufferQueue;
 use server::push_event;
+use super::configuration::Proxy;
+use {ProxyConfiguration, BackendConnectAction, ConnectionError};
 
 pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, ServerSession),
@@ -40,6 +42,7 @@ pub struct Session {
   protocol:           Option<State>,
   pub public_address: Option<SocketAddr>,
   pool:               Weak<RefCell<Pool<Buffer>>>,
+  proxy:              Weak<RefCell<Proxy>>,
   pub metrics:        SessionMetrics,
   pub app_id:         Option<String>,
   sticky_name:        String,
@@ -52,7 +55,7 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
+  pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, proxy: Weak<RefCell<Proxy>>, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Session {
     let peer_address = if expect_proxy {
@@ -79,6 +82,7 @@ impl Session {
       protocol:       state,
       public_address,
       pool,
+      proxy,
       metrics:        SessionMetrics::new(),
       app_id:         None,
       sticky_name,
@@ -736,6 +740,15 @@ impl ProxySession for Session {
     }
 
     v
+  }
+
+  fn connect_backend(&mut self, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+    let res = {
+      let proxy: Rc<RefCell<Proxy>> = self.proxy.upgrade().unwrap();
+      let res = {proxy.borrow_mut().connect_to_backend(self, back_token)};
+      res
+    };
+    res
   }
 }
 

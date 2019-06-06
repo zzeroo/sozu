@@ -34,7 +34,7 @@ pub struct Executor {
 
 pub struct Runner {
   pub ready: HashSet<usize>,
-  pub tasks: Slab<Spawn<Box<Future<Item = (), Error = ()> + Send>>>,
+  pub tasks: Slab<Spawn<Box<dyn Future<Item = (), Error = ()> + Send>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -274,9 +274,7 @@ pub fn send(worker_id: Token, message: ProxyRequest) -> FutureAnswer {
 mod tests {
   use mio::Token;
   use super::*;
-  use futures::executor::spawn;
-  use futures::task;
-  use futures::future::{lazy, result};
+  use futures::future::lazy;
   use sozu_command::proxy::{ProxyRequestData,ProxyResponseStatus};
   use sozu_command::command::CommandStatus;
 

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::io::ErrorKind;
 use slab::Slab;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::cell::RefCell;
 use std::net::{SocketAddr,Shutdown};
 use uuid::Uuid;
@@ -65,11 +65,12 @@ pub struct Session {
   timeout:            Timeout,
   last_event:         SteadyTime,
   connection_attempt: u8,
+  proxy:              Weak<RefCell<Proxy>>,
 }
 
 impl Session {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<Buffer>,
-    back_buf: Checkout<Buffer>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
+    back_buf: Checkout<Buffer>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout, proxy: Weak<RefCell<Proxy>>) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.local_addr().ok();
     let mut frontend_buffer = None;
@@ -116,6 +117,7 @@ impl Session {
       timeout,
       last_event:         SteadyTime::now(),
       connection_attempt: 0,
+      proxy,
     }
   }
 
@@ -679,6 +681,14 @@ impl ProxySession for Session {
     v
   }
 
+  fn connect_backend(&mut self, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+    let res = {
+      let proxy: Rc<RefCell<Proxy>> = self.proxy.upgrade().unwrap();
+      let res = {proxy.borrow_mut().connect_to_backend(self, back_token)};
+      res
+    };
+    res
+  }
 }
 
 pub struct Listener {
@@ -760,13 +770,15 @@ pub struct Proxy {
   backends:  Rc<RefCell<BackendMap>>,
   listeners: HashMap<Token, Listener>,
   configs:   HashMap<AppId, ApplicationConfiguration>,
+  poll:      Rc<RefCell<Poll>>,
 }
 
 impl Proxy {
-  pub fn new(backends: Rc<RefCell<BackendMap>>) -> Proxy {
+  pub fn new(backends: Rc<RefCell<BackendMap>>, poll: Rc<RefCell<Poll>>) -> Proxy {
 
     Proxy {
       backends,
+      poll,
       listeners: HashMap::new(),
       configs:   HashMap::new(),
       fronts:    HashMap::new(),
@@ -865,7 +877,7 @@ impl Proxy {
 
 impl ProxyConfiguration<Session> for Proxy {
 
-  fn connect_to_backend(&mut self, poll: &mut Poll, session: &mut Session, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, session: &mut Session, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
     if self.listeners[&session.accept_token].app_id.is_none() {
       error!("no TCP application corresponds to that front address");
       return Err(ConnectionError::HostNotFound);
@@ -889,7 +901,7 @@ impl ProxyConfiguration<Session> for Proxy {
         }
         session.back_connected = BackendConnectionStatus::Connecting;
 
-        if let Err(e) = poll.register(
+        if let Err(e) = self.poll.borrow_mut().register(
           &stream,
           back_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
@@ -909,7 +921,7 @@ impl ProxyConfiguration<Session> for Proxy {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
+  fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
     match message.order {
       ProxyRequestData::AddTcpFront(front) => {
         let _ = self.add_tcp_front(&front.app_id, &front.address);
@@ -921,15 +933,17 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        for (_, l) in self.listeners.iter_mut() {
-          l.listener.take().map(|sock| event_loop.deregister(&sock));
+        let mut v = self.listeners.drain().collect::<HashMap<_,_>>();
+        for (_, l) in v.iter_mut() {
+          l.listener.take().map(|sock| self.poll.borrow_mut().deregister(&sock));
         }
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None}
       },
       ProxyRequestData::HardStop => {
         info!("{} hard shutdown", message.id);
-        for (_, mut l) in self.listeners.drain() {
-          l.listener.take().map(|sock| event_loop.deregister(&sock));
+        let mut v = self.listeners.drain().collect::<HashMap<_,_>>();
+        for (_, mut l) in v.drain() {
+          l.listener.take().map(|sock| self.poll.borrow_mut().deregister(&sock));
         }
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
@@ -991,7 +1005,8 @@ impl ProxyConfiguration<Session> for Proxy {
     }
   }
 
-  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout)
+  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout,
+    proxy: Weak<RefCell<Self>>)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
     let internal_token = Token(token.0);
     if let Some(listener) = self.listeners.get_mut(&internal_token) {
@@ -1011,10 +1026,10 @@ impl ProxyConfiguration<Session> for Proxy {
           error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
         }
         let c = Session::new(frontend_sock, session_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
-        timeout);
+        timeout, proxy);
         incr!("tcp.requests");
 
-        if let Err(e) = poll.register(
+        if let Err(e) = self.poll.borrow_mut().register(
           c.front_socket(),
           session_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
@@ -1044,15 +1059,15 @@ impl ProxyConfiguration<Session> for Proxy {
 
 
 pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
-  use server::{self,ProxySessionCast};
+  use server;
 
-  let mut poll          = Poll::new().expect("could not create event loop");
+  let poll = Rc::new(RefCell::new(Poll::new().expect("could not create event loop")));
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-  let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
+  let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>,SessionToken> = Slab::with_capacity(max_buffers);
   {
     let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
@@ -1076,9 +1091,9 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   };
 
   let front = config.front;
-  let mut configuration = Proxy::new(backends.clone());
+  let mut configuration = Proxy::new(backends.clone(), poll.clone());
   let _ = configuration.add_listener(config, pool.clone(), token);
-  let _ = configuration.activate_listener(&mut poll, &front, None);
+  let _ = configuration.activate_listener(&mut poll.borrow_mut(), &front, None);
   let (scm_server, _scm_client) = UnixStream::pair().unwrap();
 
   let mut server_config: server::ServerConfig = Default::default();
@@ -1099,12 +1114,12 @@ mod tests {
   use std::io::{Read,Write};
   use std::{thread,str};
   use std::sync::{Arc, Barrier};
-  use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
+  use std::sync::atomic::{AtomicBool, Ordering};
   use sozu_command::scm_socket::Listeners;
   use sozu_command::proxy::{self,TcpFront,LoadBalancingParams};
   use sozu_command::channel::Channel;
   use std::os::unix::io::IntoRawFd;
-  static TEST_FINISHED: AtomicBool = ATOMIC_BOOL_INIT;
+  static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
 
   /*
   #[test]
@@ -1124,7 +1139,7 @@ mod tests {
     setup_test_logger!();
     let barrier = Arc::new(Barrier::new(2));
     start_server(barrier.clone());
-    let tx = start_proxy();
+    let _tx = start_proxy();
     barrier.wait();
 
     let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
@@ -1171,7 +1186,6 @@ mod tests {
     let listener = TcpListener::bind("127.0.0.1:5678").expect("could not parse address");
     fn handle_client(stream: &mut TcpStream, id: u8) {
       let mut buf = [0; 128];
-      let response = b" END";
       while let Ok(sz) = stream.read(&mut buf[..]) {
         if sz > 0 {
           println!("ECHO[{}] got \"{:?}\"", id, str::from_utf8(&buf[..sz]));
@@ -1195,7 +1209,7 @@ mod tests {
               handle_client(&mut stream, count)
             });
           }
-          Err(e) => { println!("connection failed"); }
+          Err(e) => { println!("connection failed: {:?}", e); }
         }
         count += 1;
       }
@@ -1203,13 +1217,13 @@ mod tests {
   }
 
   pub fn start_proxy() -> Channel<ProxyRequest,ProxyResponse> {
-    use server::{self,ProxySessionCast};
+    use server;
 
     info!("listen for connections");
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
     thread::spawn(move|| {
       info!("starting event loop");
-      let mut poll = Poll::new().expect("could not create event loop");
+      let poll = Rc::new(RefCell::new(Poll::new().expect("could not create event loop")));
       let max_buffers = 100;
       let buffer_size = 16384;
       let pool = Rc::new(RefCell::new(
@@ -1217,7 +1231,7 @@ mod tests {
       ));
       let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-      let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
+      let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>,SessionToken> = Slab::with_capacity(max_buffers);
       {
         let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
         info!("taking token {:?} for channel", entry.index());
@@ -1234,7 +1248,7 @@ mod tests {
         entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
       }
 
-      let mut configuration = Proxy::new(backends.clone());
+      let mut configuration = Proxy::new(backends.clone(), poll.clone());
       let listener_config = TcpListenerConfig {
         front: "127.0.0.1:1234".parse().unwrap(),
         public_address: None,
@@ -1245,7 +1259,7 @@ mod tests {
         let front = listener_config.front.clone();
         let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
         let _ = configuration.add_listener(listener_config, pool.clone(), Token(entry.index().0));
-        let _ = configuration.activate_listener(&mut poll, &front, None);
+        let _ = configuration.activate_listener(&mut poll.borrow_mut(), &front, None);
         entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::TCPListen })));
       }
 

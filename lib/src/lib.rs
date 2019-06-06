@@ -11,8 +11,11 @@
 //! structure (there are configuration structures for the HTTPS and TCP proxies
 //! too).
 //!
-//! ```ignore
-//! let config = proxy::HttpProxyConfiguration {
+//! ```
+//! # extern crate sozu_command_lib;
+//! use sozu_command_lib::proxy;
+//!
+//! let config = proxy::HttpListener {
 //!   front: "198.51.100.0:80".parse().unwrap(),
 //!   ..Default::default()
 //! };
@@ -21,18 +24,23 @@
 //! Then create the required elements to communicate with the proxy thread,
 //! and launch the thread:
 //!
-//! ```ignore
-//! let config = proxy::HttpProxyConfiguration {
+//! ```
+//! # extern crate sozu_command_lib;
+//! # use std::thread;
+//! use sozu_command_lib::{proxy, channel::Channel};
+//!
+//! let config = proxy::HttpListener {
 //!   front: "198.51.100.0:80".parse().unwrap(),
 //!   ..Default::default()
 //! };
 //!
 //! let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 //!
-//! let jg            = thread::spawn(move || {
-//!    network::http::start(config, channel);
+//! thread::spawn(move || {
+//!   let max_buffers = 500;
+//!   let buffer_size = 16384;
+//!   sozu_lib::http::start(config, channel, max_buffers, buffer_size);
 //! });
-//!
 //! ```
 //!
 //! The `tx, rx` channel here is a mio channel through which the proxy will
@@ -45,27 +53,52 @@
 //! the connections, parse the request, then send a default (but configurable)
 //! answer.
 //!
-//! ```ignore
+//! ```no_run
+//! # extern crate sozu_command_lib;
+//! # use sozu_command_lib::{proxy, channel::Channel};
+//! # use std::thread;
+//! #
+//! # let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+//! #
+//! # let config = proxy::HttpListener {
+//! #   front: "198.51.100.0:80".parse().unwrap(),
+//! #   ..Default::default()
+//! # };
+//! #
+//! # thread::spawn(move || {
+//! #   let max_buffers = 500;
+//! #   let buffer_size = 16384;
+//! #   sozu_lib::http::start(config, channel, max_buffers, buffer_size);
+//! # });
+//!
 //! let http_front = proxy::HttpFront {
-//!   app_id:     String::from("test"),
-//!   hostname:   String::from("example.com"),
-//!   path_begin: String::from("/")
+//!   // address of the listener
+//!   address:  "127.0.0.1:8080".parse().unwrap(),
+//!   app_id:   String::from("test"),
+//!   hostname: String::from("example.com"),
+//!   path:     proxy::PathRule::Prefix(String::from("/")),
+//!   position: proxy::RulePosition::Tree,
 //! };
+//!
 //! let http_backend = proxy::Backend {
-//!   app_id:     String::from("test"),
-//!   ip_address: String::from("192.0.2.1"),
-//!   port:       8080
+//!   // address of the backend server
+//!   address:                   "192.0.2.1:8080".parse().unwrap(),
+//!   app_id:                    String::from("test"),
+//!   backend_id:                String::from("test-0"),
+//!   load_balancing_parameters: Some(proxy::LoadBalancingParams::default()),
+//!   sticky_id:                 None,
+//!   backup:                    None,
 //! };
 //!
 //! command.write_message(&proxy::ProxyRequest {
 //!   id:    String::from("ID_ABCD"),
 //!   order: proxy::ProxyRequestData::AddHttpFront(http_front)
-//! ));
+//! });
 //!
 //! command.write_message(&proxy::ProxyRequest {
 //!   id:    String::from("ID_EFGH"),
 //!   order: proxy::ProxyRequestData::AddBackend(http_backend)
-//! ));
+//! });
 //!
 //! println!("HTTP -> {:?}", command.read_message());
 //! println!("HTTP -> {:?}", command.read_message());
@@ -91,61 +124,60 @@
 //!
 //! Here is the complete example for reference:
 //!
-//! ```ignore
-//! #[macro_use] extern crate log;
-//! extern crate env_logger;
+//! ```no_run
 //! extern crate sozu_lib as sozu;
 //! extern crate sozu_command_lib as sozu_command;
-//! extern crate openssl;
-//! extern crate mio;
 //!
-//! use std::thread;
-//! use std::sync::mpsc;
-//! use sozu_command::messages;
-//! use sozu_command::channel::Channel;
-//! use sozu::network;
+//! use std::{thread, sync::mpsc, io::stdout};
+//! use sozu_command::{proxy, channel::Channel};
 //!
 //! fn main() {
-//!   env_logger::init().unwrap();
-//!   info!("starting up");
-//!
-//!   let config = proxy::HttpProxyConfiguration {
+//!   let config = proxy::HttpListener {
 //!     front: "198.51.100.0:80".parse().unwrap(),
 //!     ..Default::default()
 //!   };
 //!
 //!   let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 //!
-//!   let jg            = thread::spawn(move || {
-//!      network::http::start(config, channel);
+//!   let jg = thread::spawn(move || {
+//!     let max_buffers = 500;
+//!     let buffer_size = 16384;
+//!     sozu::http::start(config, channel, max_buffers, buffer_size);
 //!   });
 //!
 //!   let http_front = proxy::HttpFront {
-//!     app_id:     String::from("test"),
-//!     hostname:   String::from("example.com"),
-//!     path_begin: String::from("/")
+//!     // address of the listener
+//!     address:  "127.0.0.1:8080".parse().unwrap(),
+//!     app_id:   String::from("test"),
+//!     hostname: String::from("example.com"),
+//!     path:     proxy::PathRule::Prefix(String::from("/")),
+//!     position: proxy::RulePosition::Tree,
 //!   };
+//!
 //!   let http_backend = proxy::Backend {
-//!     app_id:     String::from("test"),
-//!     ip_address: String::from("192.0.2.1"),
-//!     port:       8080
+//!     // address of the backend server
+//!     address:                   "192.0.2.1:8080".parse().unwrap(),
+//!     app_id:                    String::from("test"),
+//!     backend_id:                String::from("test-0"),
+//!     load_balancing_parameters: Some(proxy::LoadBalancingParams::default()),
+//!     sticky_id:                 None,
+//!     backup:                    None,
 //!   };
 //!
 //!   command.write_message(&proxy::ProxyRequest {
 //!     id:    String::from("ID_ABCD"),
 //!     order: proxy::ProxyRequestData::AddHttpFront(http_front)
-//!   ));
+//!   });
 //!
 //!   command.write_message(&proxy::ProxyRequest {
 //!     id:    String::from("ID_EFGH"),
 //!     order: proxy::ProxyRequestData::AddBackend(http_backend)
-//!   ));
+//!   });
 //!
 //!   println!("HTTP -> {:?}", command.read_message());
-//!   println!("HTTP -> {:?}", command.write_message());
+//!   println!("HTTP -> {:?}", command.read_message());
 //!
 //!   let _ = jg.join();
-//!   info!("good bye");
 //! }
 //! ```
 //!
@@ -210,7 +242,7 @@ use mio::net::TcpStream;
 use std::fmt;
 use std::str;
 use std::net::SocketAddr;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::cell::RefCell;
 use time::{SteadyTime,Duration};
 use mio_extras::timer::{Timer,Timeout};
@@ -250,6 +282,7 @@ pub trait ProxySession {
   fn last_event(&self) -> SteadyTime;
   fn print_state(&self);
   fn tokens(&self) -> Vec<Token>;
+  fn connect_backend(&mut self, back_token: Token) -> Result<BackendConnectAction,ConnectionError>;
 }
 
 #[derive(Clone,Copy,Debug,PartialEq)]
@@ -275,11 +308,11 @@ pub enum AcceptError {
 
 use self::server::{ListenToken,ListenPortState};
 pub trait ProxyConfiguration<Session> {
-  fn connect_to_backend(&mut self, event_loop: &mut Poll, session: &mut Session,
+  fn connect_to_backend(&mut self, session: &mut Session,
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
-  fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse;
+  fn notify(&mut self, message: ProxyRequest) -> ProxyResponse;
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
-  fn create_session(&mut self, socket: TcpStream, token: ListenToken, event_loop: &mut Poll, session_token: Token, timeout: Timeout)
+  fn create_session(&mut self, socket: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout, proxy: Weak<RefCell<Self>>)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
   fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }

@@ -118,17 +118,17 @@ impl Default for ServerConfig {
 }
 
 pub struct Server {
-  pub poll:        Poll,
+  pub poll:        Rc<RefCell<Poll>>,
   shutting_down:   Option<MessageId>,
   accept_ready:    HashSet<ListenToken>,
   can_accept:      bool,
   channel:         ProxyChannel,
-  http:            http::Proxy,
+  http:            Rc<RefCell<http::Proxy>>,
   https:           HttpsProvider,
-  tcp:             tcp::Proxy,
+  tcp:             Rc<RefCell<tcp::Proxy>>,
   config_state:    ConfigState,
   scm:             ScmSocket,
-  sessions:        Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
+  sessions:        Slab<Rc<RefCell<dyn ProxySession>>,SessionToken>,
   max_connections: usize,
   nb_connections:  usize,
   front_timeout:   time::Duration,
@@ -144,7 +144,7 @@ pub struct Server {
 
 impl Server {
   pub fn new_from_config(channel: ProxyChannel, scm: ScmSocket, config: Config, config_state: ConfigState) -> Self {
-    let event_loop  = Poll::new().expect("could not create event loop");
+    let poll = Rc::new(RefCell::new(Poll::new().expect("could not create event loop")));
     let pool = Rc::new(RefCell::new(
       Pool::with_capacity(2*config.max_buffers, 0, || Buffer::with_capacity(config.buffer_size))
     ));
@@ -152,7 +152,7 @@ impl Server {
 
     //FIXME: we will use a few entries for the channel, metrics socket and the listeners
     //FIXME: for HTTP/2, we will have more than 2 entries per session
-    let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(10+2*config.max_connections);
+    let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>,SessionToken> = Slab::with_capacity(10+2*config.max_connections);
     {
       let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
       trace!("taking token {:?} for channel", entry.index());
@@ -170,14 +170,14 @@ impl Server {
     }
 
     let use_openssl = config.tls_provider == TlsProvider::Openssl;
-    let https = HttpsProvider::new(use_openssl, pool.clone(), backends.clone());
+    let https = HttpsProvider::new(use_openssl, pool.clone(), backends.clone(), poll.clone());
 
     let server_config = ServerConfig::from_config(&config);
-    Server::new(event_loop, channel, scm, sessions, pool, backends, None, Some(https), None, server_config, Some(config_state))
+    Server::new(poll, channel, scm, sessions, pool, backends, None, Some(https), None, server_config, Some(config_state))
   }
 
-  pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
-    sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
+  pub fn new(poll: Rc<RefCell<Poll>>, channel: ProxyChannel, scm: ScmSocket,
+    sessions: Slab<Rc<RefCell<dyn ProxySession>>,SessionToken>,
     pool: Rc<RefCell<Pool<Buffer>>>,
     backends: Rc<RefCell<BackendMap>>,
     http: Option<http::Proxy>,
@@ -186,7 +186,7 @@ impl Server {
     server_config: ServerConfig,
     config_state: Option<ConfigState>) -> Self {
 
-    poll.register(
+    poll.borrow_mut().register(
       &channel,
       Token(0),
       Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
@@ -194,7 +194,7 @@ impl Server {
     ).expect("should register the channel");
 
     let timer = Timer::default();
-    poll.register(
+    poll.borrow_mut().register(
       &timer,
       Token(1),
       Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
@@ -203,21 +203,21 @@ impl Server {
 
     METRICS.with(|metrics| {
       if let Some(sock) = (*metrics.borrow()).socket() {
-        poll.register(sock, Token(2), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
+        poll.borrow_mut().register(sock, Token(2), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
       }
     });
 
     let base_sessions_count = sessions.len();
 
     let mut server = Server {
-      poll,
+      poll:            poll.clone(),
       shutting_down:   None,
       accept_ready:    HashSet::new(),
       can_accept:      true,
       channel,
-      http:            http.unwrap_or_else(|| http::Proxy::new(pool.clone(), backends.clone())),
-      https:           https.unwrap_or_else(|| HttpsProvider::new(false, pool.clone(), backends.clone())),
-      tcp:             tcp.unwrap_or_else(|| tcp::Proxy::new(backends.clone())),
+      http:            Rc::new(RefCell::new(http.unwrap_or_else(|| http::Proxy::new(pool.clone(), backends.clone(), poll.clone())))),
+      https:           https.unwrap_or_else(|| HttpsProvider::new(false, pool.clone(), backends.clone(), poll.clone())),
+      tcp:             Rc::new(RefCell::new(tcp.unwrap_or_else(|| tcp::Proxy::new(backends.clone(), poll.clone())))),
       config_state:    ConfigState::new(),
       scm,
       sessions,
@@ -280,7 +280,7 @@ impl Server {
         panic!("poll() calls failed {} times in a row", current_poll_errors);
       }
 
-      if let Err(error) = self.poll.poll(&mut events, poll_timeout) {
+      if let Err(error) = self.poll.borrow_mut().poll(&mut events, poll_timeout) {
         error!("Error while polling events: {:?}", error);
         current_poll_errors += 1;
         continue;
@@ -611,7 +611,7 @@ impl Server {
           let entry = entry.unwrap();
           let token = Token(entry.index().0);
 
-          let status = if self.http.add_listener(listener.clone(), token).is_some() {
+          let status = if self.http.borrow_mut().add_listener(listener.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
             self.base_sessions_count += 1;
             ProxyResponseStatus::Ok
@@ -627,7 +627,7 @@ impl Server {
           if remove.proxy == ListenerType::HTTP {
             debug!("{} remove http listener {:?}", id, remove);
             self.base_sessions_count -= 1;
-            push_queue(self.http.notify(&mut self.poll, ProxyRequest {
+            push_queue(self.http.borrow_mut().notify(ProxyRequest {
               id: id.to_string(),
               order: ProxyRequestData::RemoveListener(remove.clone())
             }));
@@ -638,7 +638,8 @@ impl Server {
             debug!("{} activate http listener {:?}", id, activate);
             let listener = self.scm_listeners.as_mut().and_then(|s| s.get_http(&activate.front))
               .map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
-            let status = match self.http.activate_listener(&mut self.poll, &activate.front, listener) {
+            let opt_token = {self.http.borrow_mut().activate_listener(&mut self.poll.borrow_mut(), &activate.front, listener)};
+            let status = match opt_token {
               Some(token) => {
                 self.accept(ListenToken(token.0), Protocol::HTTPListen);
                 ProxyResponseStatus::Ok
@@ -656,8 +657,8 @@ impl Server {
         ProxyRequest { ref id, order: ProxyRequestData::DeactivateListener(ref deactivate) } => {
           if deactivate.proxy == ListenerType::HTTP {
             debug!("{} deactivate HTTP listener {:?}", id, deactivate);
-            let status = match self.http.deactivate_listener(&mut self.poll, &deactivate.front) {
-              Some(listener) => ProxyResponseStatus::Ok,
+            let status = match self.http.borrow_mut().deactivate_listener(&mut self.poll.borrow_mut(), &deactivate.front) {
+              Some(_listener) => ProxyResponseStatus::Ok,
               None => {
                 error!("Couldn't deactivate HTTP listener");
                 ProxyResponseStatus::Error(String::from("cannot deactivate HTTP listener"))
@@ -668,7 +669,7 @@ impl Server {
             push_queue(answer);
           }
         },
-        ref m => push_queue(self.http.notify(&mut self.poll, m.clone())),
+        ref m => push_queue(self.http.borrow_mut().notify(m.clone())),
       }
     }
     if topics.contains(&Topic::HttpsProxyConfig) {
@@ -717,7 +718,7 @@ impl Server {
           if remove.proxy == ListenerType::HTTPS {
             debug!("{} remove https listener {:?}", id, remove);
             self.base_sessions_count -= 1;
-            push_queue(self.https.notify(&mut self.poll, ProxyRequest {
+            push_queue(self.https.notify(ProxyRequest {
               id: id.to_string(),
               order: ProxyRequestData::RemoveListener(remove.clone())
             }));
@@ -728,7 +729,9 @@ impl Server {
             debug!("{} activate https listener {:?}", id, activate);
             let listener = self.scm_listeners.as_mut().and_then(|s| s.get_https(&activate.front))
               .map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
-            let status = match self.https.activate_listener(&mut self.poll, &activate.front, listener) {
+
+            let opt_token = { self.https.activate_listener(&mut self.poll.borrow_mut(), &activate.front, listener) };
+            let status = match opt_token {
               Some(token) => {
                 self.accept(ListenToken(token.0), Protocol::HTTPSListen);
                 ProxyResponseStatus::Ok
@@ -746,8 +749,8 @@ impl Server {
         ProxyRequest { ref id, order: ProxyRequestData::DeactivateListener(ref deactivate) } => {
           if deactivate.proxy == ListenerType::HTTPS {
             debug!("{} deactivate HTTPS listener {:?}", id, deactivate);
-            let status = match self.https.deactivate_listener(&mut self.poll, &deactivate.front) {
-              Some(listener) => ProxyResponseStatus::Ok,
+            let status = match self.https.deactivate_listener(&mut self.poll.borrow_mut(), &deactivate.front) {
+              Some(_listener) => ProxyResponseStatus::Ok,
               None => {
                 error!("Couldn't deactivate HTTPS listener");
                 ProxyResponseStatus::Error(String::from("cannot deactivate HTTPS listener"))
@@ -758,7 +761,7 @@ impl Server {
             push_queue(answer);
           }
         },
-        ref m => push_queue(self.https.notify(&mut self.poll, m.clone())),
+        ref m => push_queue(self.https.notify(m.clone())),
       }
     }
     if topics.contains(&Topic::TcpProxyConfig) {
@@ -791,7 +794,7 @@ impl Server {
           let entry = entry.unwrap();
           let token = Token(entry.index().0);
 
-          let status = if self.tcp.add_listener(listener.clone(), self.pool.clone(), token).is_some() {
+          let status = if self.tcp.borrow_mut().add_listener(listener.clone(), self.pool.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::TCPListen })));
             self.base_sessions_count += 1;
             ProxyResponseStatus::Ok
@@ -806,7 +809,7 @@ impl Server {
           if remove.proxy == ListenerType::TCP {
             debug!("{} remove tcp listener {:?}", id, remove);
             self.base_sessions_count -= 1;
-            push_queue(self.tcp.notify(&mut self.poll, ProxyRequest {
+            push_queue(self.tcp.borrow_mut().notify(ProxyRequest {
               id: id.to_string(),
               order: ProxyRequestData::RemoveListener(remove.clone())
             }));
@@ -817,7 +820,9 @@ impl Server {
             debug!("{} activate tcp listener {:?}", id, activate);
             let listener = self.scm_listeners.as_mut().and_then(|s| s.get_tcp(&activate.front))
               .map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
-            let status = match self.tcp.activate_listener(&mut self.poll, &activate.front, listener) {
+
+            let opt_token = { self.tcp.borrow_mut().activate_listener(&mut self.poll.borrow_mut(), &activate.front, listener) };
+            let status = match opt_token {
               Some(token) => {
                 self.accept(ListenToken(token.0), Protocol::TCPListen);
                 ProxyResponseStatus::Ok
@@ -835,8 +840,8 @@ impl Server {
         ProxyRequest { ref id, order: ProxyRequestData::DeactivateListener(ref deactivate) } => {
           if deactivate.proxy == ListenerType::TCP {
             debug!("{} deactivate tcp listener {:?}", id, deactivate);
-            let status = match self.tcp.deactivate_listener(&mut self.poll, &deactivate.front) {
-              Some(listener) => ProxyResponseStatus::Ok,
+            let status = match self.tcp.borrow_mut().deactivate_listener(&mut self.poll.borrow_mut(), &deactivate.front) {
+              Some(_listener) => ProxyResponseStatus::Ok,
               None => {
                 error!("Couldn't deactivate TCP listener");
                 ProxyResponseStatus::Error(String::from("cannot deactivate TCP listener"))
@@ -847,7 +852,7 @@ impl Server {
             push_queue(answer);
           }
         }
-        m => push_queue(self.tcp.notify(&mut self.poll, m)),
+        m => push_queue(self.tcp.borrow_mut().notify(m)),
       }
     }
   }
@@ -855,23 +860,23 @@ impl Server {
   pub fn return_listen_sockets(&mut self) {
     self.scm.set_blocking(false);
 
-    let http_listeners = self.http.give_back_listeners();
+    let http_listeners = self.http.borrow_mut().give_back_listeners();
     for &(_, ref sock) in http_listeners.iter() {
-      if let Err(e) = self.poll.deregister(sock) {
+      if let Err(e) = self.poll.borrow_mut().deregister(sock) {
         error!("error deregistering HTTP listen socket({:?}): {:?}", sock, e);
       }
     }
 
     let https_listeners = self.https.give_back_listeners();
     for &(_, ref sock) in https_listeners.iter() {
-      if let Err(e) = self.poll.deregister(sock) {
+      if let Err(e) = self.poll.borrow_mut().deregister(sock) {
         error!("error deregistering HTTPS listen socket({:?}): {:?}", sock, e);
       }
     }
 
-    let tcp_listeners = self.tcp.give_back_listeners();
+    let tcp_listeners = self.tcp.borrow_mut().give_back_listeners();
     for &(_, ref sock) in tcp_listeners.iter() {
-      if let Err(e) = self.poll.deregister(sock) {
+      if let Err(e) = self.poll.borrow_mut().deregister(sock) {
         error!("error deregistering TCP listen socket({:?}): {:?}", sock, e);
       }
     }
@@ -901,7 +906,7 @@ impl Server {
     if self.sessions.contains(token) {
       let session = self.sessions.remove(token).expect("session shoud be there");
       session.borrow().cancel_timeouts(&mut self.timer);
-      let CloseResult { tokens } = session.borrow_mut().close(&mut self.poll);
+      let CloseResult { tokens } = session.borrow_mut().close(&mut self.poll.borrow_mut());
 
       for tk in tokens.into_iter() {
         let cl = self.to_session(tk);
@@ -940,7 +945,8 @@ impl Server {
         let session_token = Token(entry.index().0);
         let index = entry.index();
         let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
-        match self.tcp.create_session(socket, token, &mut self.poll, session_token, timeout) {
+        let tcp = Rc::downgrade(&self.tcp);
+        match self.tcp.borrow_mut().create_session(socket, token, session_token, timeout, tcp) {
           Ok((session, should_connect)) => {
             entry.insert(session);
             self.nb_connections += 1;
@@ -992,7 +998,9 @@ impl Server {
       Some(entry) => {
         let session_token = Token(entry.index().0);
         let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
-        match self.http.create_session(socket, token, &mut self.poll, session_token, timeout) {
+        let http = Rc::downgrade(&self.http);
+
+        match self.http.borrow_mut().create_session(socket, token, session_token, timeout, http) {
           Ok((session, _)) => {
             entry.insert(session);
             self.nb_connections += 1;
@@ -1036,7 +1044,8 @@ impl Server {
       Some(entry) => {
         let session_token = Token(entry.index().0);
         let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
-        match self.https.create_session(socket, token, &mut self.poll, session_token, timeout) {
+
+        match self.https.create_session(socket, token, session_token, timeout) {
           Ok((session, _)) => {
             entry.insert(session);
             self.nb_connections += 1;
@@ -1066,7 +1075,7 @@ impl Server {
     match protocol {
       Protocol::TCPListen   => {
         loop {
-          match self.tcp.accept(token) {
+          match self.tcp.borrow_mut().accept(token) {
             Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::TCPListen, SteadyTime::now())),
             Err(AcceptError::WouldBlock) => {
               self.accept_ready.remove(&token);
@@ -1082,7 +1091,7 @@ impl Server {
       },
       Protocol::HTTPListen  => {
         loop {
-          match self.http.accept(token) {
+          match self.http.borrow_mut().accept(token) {
             Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::HTTPListen, SteadyTime::now())),
             Err(AcceptError::WouldBlock) => {
               self.accept_ready.remove(&token);
@@ -1161,42 +1170,23 @@ impl Server {
     }
 
     let (protocol, res) = {
-      let cl = self.sessions[token].clone();
-      let cl2: Rc<RefCell<ProxySessionCast>> = self.sessions[token].clone();
-      let protocol = { cl.borrow().protocol() };
+      let client = self.sessions[token].clone();
+      let cl2: Rc<RefCell<dyn ProxySession>> = self.sessions[token].clone();
+      let protocol = { client.borrow().protocol() };
       let entry = self.sessions.vacant_entry();
       if entry.is_none() {
         error!("not enough memory, cannot connect to backend");
         return;
       }
       let entry = entry.unwrap();
-      let entry = entry.insert(cl);
+      let entry = entry.insert(cl2);
       let back_token = Token(entry.index().0);
 
-      let (protocol, res) = match protocol {
-        Protocol::TCP   => {
-          let mut b = cl2.borrow_mut();
-          let session: &mut tcp::Session = b.as_tcp() ;
-          let r = self.tcp.connect_to_backend(&mut self.poll, session, back_token);
+      if protocol != Protocol::TCP && protocol != Protocol::HTTP && protocol != Protocol::HTTPS {
+        panic!("should not call connect_to_backend on listeners");
+      }
 
-          (Protocol::TCP, r)
-        },
-        Protocol::HTTP  => {
-          (Protocol::HTTP, {
-            let mut b = cl2.borrow_mut();
-            let session: &mut http::Session = b.as_http() ;
-            self.http.connect_to_backend(&mut self.poll, session, back_token)
-          })
-        },
-        Protocol::HTTPS => {
-          (Protocol::HTTPS, {
-            self.https.connect_to_backend(&mut self.poll, cl2, back_token)
-          })
-        },
-        _ => {
-          panic!("should not call connect_to_backend on listeners");
-        },
-      };
+      let res = client.borrow_mut().connect_backend(back_token);
 
       if res != Ok(BackendConnectAction::New) {
         entry.remove();
@@ -1230,7 +1220,7 @@ impl Server {
         if let Some(token) = opt {
           let cl = self.to_session(token);
           if let Some(session) = self.sessions.remove(cl) {
-            session.borrow_mut().close_backend(token, &mut self.poll);
+            session.borrow_mut().close_backend(token, &mut self.poll.borrow_mut());
           }
         }
       },
@@ -1238,7 +1228,7 @@ impl Server {
         if let Some(t) = backend_token {
           let cl = self.to_session(t);
           if let Some(session) = self.sessions.remove(cl) {
-            session.borrow_mut().close_backend(t, &mut self.poll);
+            session.borrow_mut().close_backend(t, &mut self.poll.borrow_mut());
           }
         }
 
@@ -1354,17 +1344,17 @@ impl Server {
   }
 
   fn listen_port_state(&self, port: &u16) -> ListenPortState {
-    let http_bound = self.http.listen_port_state(&port);
+    let http_bound = self.http.borrow().listen_port_state(&port);
 
     if http_bound == ListenPortState::Available {
       let https_bound = match self.https {
         #[cfg(feature = "use-openssl")]
-        HttpsProvider::Openssl(ref openssl) => openssl.listen_port_state(&port),
-        HttpsProvider::Rustls(ref rustls) => rustls.listen_port_state(&port),
+        HttpsProvider::Openssl(ref openssl) => openssl.borrow().listen_port_state(&port),
+        HttpsProvider::Rustls(ref rustls) => rustls.borrow().listen_port_state(&port),
       };
 
       if https_bound == ListenPortState::Available {
-        return self.tcp.listen_port_state(&port);
+        return self.tcp.borrow().listen_port_state(&port);
       }
     }
 
@@ -1412,6 +1402,9 @@ impl ProxySession for ListenSession {
     unimplemented!();
   }
 
+  fn connect_backend(&mut self, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+    unimplemented!()
+  }
 }
 
 #[cfg(feature = "use-openssl")]
@@ -1421,95 +1414,104 @@ use https_rustls;
 
 #[cfg(feature = "use-openssl")]
 pub enum HttpsProvider {
-  Openssl(https_openssl::Proxy),
-  Rustls(https_rustls::configuration::Proxy),
+  Openssl(Rc<RefCell<https_openssl::Proxy>>),
+  Rustls(Rc<RefCell<https_rustls::configuration::Proxy>>),
 }
 
 #[cfg(not(feature = "use-openssl"))]
 pub enum HttpsProvider {
-  Rustls(https_rustls::configuration::Proxy),
+  Rustls(Rc<RefCell<https_rustls::configuration::Proxy>>),
 }
 
 #[cfg(feature = "use-openssl")]
 impl HttpsProvider {
-  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>, poll: Rc<RefCell<Poll>>) -> HttpsProvider {
     if use_openssl {
-      HttpsProvider::Openssl(https_openssl::Proxy::new(pool, backends))
+      HttpsProvider::Openssl(Rc::new(RefCell::new(https_openssl::Proxy::new(pool, backends, poll))))
     } else {
-      HttpsProvider::Rustls(https_rustls::configuration::Proxy::new(pool, backends))
+      HttpsProvider::Rustls(Rc::new(RefCell::new(https_rustls::configuration::Proxy::new(pool, backends, poll))))
     }
   }
 
-  pub fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
+  pub fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.notify(event_loop, message),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.notify(event_loop, message),
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.borrow_mut().notify(message),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.borrow_mut().notify(message),
     }
   }
 
   pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
 
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.add_listener(config, token),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.add_listener(config, token),
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.borrow_mut().add_listener(config, token),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.borrow_mut().add_listener(config, token),
     }
   }
 
   pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
 
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.activate_listener(event_loop, addr, tcp_listener),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.activate_listener(event_loop, addr, tcp_listener),
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.borrow_mut().activate_listener(event_loop, addr, tcp_listener),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.borrow_mut().activate_listener(event_loop, addr, tcp_listener),
     }
   }
 
   pub fn deactivate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr) -> Option<TcpListener> {
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.deactivate_listener(event_loop, addr),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.deactivate_listener(event_loop, addr),
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.borrow_mut().deactivate_listener(event_loop, addr),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.borrow_mut().deactivate_listener(event_loop, addr),
     }
   }
 
   pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr,TcpListener)> {
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.give_back_listeners(),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.give_back_listeners(),
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.borrow_mut().give_back_listeners(),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.borrow_mut().give_back_listeners(),
     }
   }
 
   pub fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.accept(token),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.accept(token),
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.borrow_mut().accept(token),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.borrow_mut().accept(token),
     }
   }
 
-  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<ProxySessionCast>>,bool), AcceptError> {
+  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<dyn ProxySession>>,bool), AcceptError> {
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.create_session(frontend_sock, token, poll, session_token, timeout).map(|(r,b)| {
-        (r as Rc<RefCell<ProxySessionCast>>, b)
-      }),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.create_session(frontend_sock, token, poll, session_token, timeout).map(|(r,b)| {
-        (r as Rc<RefCell<ProxySessionCast>>, b)
-      }),
+      &mut HttpsProvider::Rustls(ref mut rustls)   => {
+        let proxy = Rc::downgrade(rustls);
+        rustls.borrow_mut().create_session(frontend_sock, token, session_token, timeout, proxy).map(|(r,b)| {
+          (r as Rc<RefCell<dyn ProxySession>>, b)
+        })
+      },
+      &mut HttpsProvider::Openssl(ref mut openssl) => {
+        let proxy = Rc::downgrade(openssl);
+        openssl.borrow_mut().create_session(frontend_sock, token, session_token, timeout, proxy).map(|(r,b)| {
+          (r as Rc<RefCell<dyn ProxySession>>, b)
+        })
+      },
     }
   }
 
-  pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_session: Rc<RefCell<ProxySessionCast>>, back_token: Token)
+  pub fn connect_to_backend(&mut self, proxy_session: Rc<RefCell<dyn ProxySession>>, back_token: Token)
     -> Result<BackendConnectAction, ConnectionError> {
 
+      unimplemented!()
+  /*
     match self {
       &mut HttpsProvider::Rustls(ref mut rustls)   => {
         let mut b = proxy_session.borrow_mut();
         let session: &mut https_rustls::session::Session = b.as_https_rustls();
-        rustls.connect_to_backend(poll, session, back_token)
+        rustls.borrow_mut().connect_to_backend(session, back_token)
       },
       &mut HttpsProvider::Openssl(ref mut openssl) => {
         let mut b = proxy_session.borrow_mut();
         let session: &mut https_openssl::Session = b.as_https_openssl();
-        openssl.connect_to_backend(poll, session, back_token)
+        openssl.borrow_mut().connect_to_backend(session, back_token)
       }
     }
+    */
 
   }
 }
@@ -1519,150 +1521,63 @@ use https_rustls::session::Session;
 
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
-  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>, poll: Rc<RefCell<Poll>>) -> HttpsProvider {
     if use_openssl {
       error!("the openssl provider is not compiled, continuing with the rustls provider");
     }
 
-    let configuration = https_rustls::configuration::Proxy::new(pool, backends);
-    HttpsProvider::Rustls(configuration)
+    let configuration = https_rustls::configuration::Proxy::new(pool, backends, poll);
+    HttpsProvider::Rustls(Rc::new(RefCell::new(configuration)))
   }
 
-  pub fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
+  pub fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.notify(event_loop, message)
+    rustls.borrow_mut().notify(message)
   }
 
   pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.add_listener(config, token)
+    rustls.borrow_mut().add_listener(config, token)
   }
 
   pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
 
-    rustls.activate_listener(event_loop, addr, tcp_listener)
+    rustls.borrow_mut().activate_listener(event_loop, addr, tcp_listener)
   }
 
   pub fn deactivate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr) -> Option<TcpListener> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
 
-    rustls.deactivate_listener(event_loop, addr)
+    rustls.borrow_mut().deactivate_listener(event_loop, addr)
   }
 
   pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.give_back_listeners()
+    rustls.borrow_mut().give_back_listeners()
   }
 
   pub fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.accept(token)
+    rustls.borrow_mut().accept(token)
   }
 
-  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<Session>>,bool), AcceptError> {
+  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<Session>>,bool), AcceptError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.create_session(frontend_sock, token, poll, session_token, timeout)
+    let proxy = Rc::downgrade(rustls);
+    rustls.borrow_mut().create_session(frontend_sock, token, session_token, timeout, proxy)
   }
 
-  pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_session: Rc<RefCell<ProxySessionCast>>, back_token: Token)
+  pub fn connect_to_backend(&mut self,  proxy_session: Rc<RefCell<dyn ProxySession>>, back_token: Token)
     -> Result<BackendConnectAction, ConnectionError> {
+    unimplemented!()
+    /*
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
 
     let mut b = proxy_session.borrow_mut();
     let session: &mut https_rustls::session::Session = b.as_https_rustls() ;
-    rustls.connect_to_backend(poll, session, back_token)
+    rustls.borrow_mut().connect_to_backend(session, back_token)
+    */
   }
-}
-
-#[cfg(not(feature = "use-openssl"))]
-/// this trait is used to work around the fact that we need to transform
-/// the sessions (that are all stored as a ProxySession in the slab) back
-/// to their original type to call the `connect_to_backend` method of
-/// their corresponding `Proxy`.
-/// If we find a way to make `connect_to_backend` work wothout transforming
-/// back to the type (example: storing a reference to the configuration
-/// in the session and making `connect_to_backend` a method of `ProxySession`?),
-/// we'll be able to remove all those ugly casts and panics
-pub trait ProxySessionCast: ProxySession {
-  fn as_tcp(&mut self) -> &mut tcp::Session;
-  fn as_http(&mut self) -> &mut http::Session;
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session;
-}
-
-#[cfg(feature = "use-openssl")]
-pub trait ProxySessionCast: ProxySession {
-  fn as_tcp(&mut self) -> &mut tcp::Session;
-  fn as_http(&mut self) -> &mut http::Session;
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session;
-  fn as_https_openssl(&mut self) -> &mut https_openssl::Session;
-}
-
-#[cfg(not(feature = "use-openssl"))]
-impl ProxySessionCast for ListenSession {
-  fn as_http(&mut self) -> &mut http::Session { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session { panic!() }
-}
-
-#[cfg(feature = "use-openssl")]
-impl ProxySessionCast for ListenSession {
-  fn as_http(&mut self) -> &mut http::Session { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session { panic!() }
-  fn as_https_openssl(&mut self) -> &mut https_openssl::Session { panic!() }
-}
-
-#[cfg(not(feature = "use-openssl"))]
-impl ProxySessionCast for http::Session {
-  fn as_http(&mut self) -> &mut http::Session { self }
-  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session { panic!() }
-}
-
-#[cfg(feature = "use-openssl")]
-impl ProxySessionCast for http::Session {
-  fn as_http(&mut self) -> &mut http::Session { self }
-  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session { panic!() }
-  fn as_https_openssl(&mut self) -> &mut https_openssl::Session { panic!() }
-}
-
-#[cfg(not(feature = "use-openssl"))]
-impl ProxySessionCast for tcp::Session {
-  fn as_http(&mut self) -> &mut http::Session { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Session { self }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session { panic!() }
-}
-
-#[cfg(feature = "use-openssl")]
-impl ProxySessionCast for tcp::Session {
-  fn as_http(&mut self) -> &mut http::Session { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Session { self }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session { panic!() }
-  fn as_https_openssl(&mut self) -> &mut https_openssl::Session { panic!() }
-}
-
-#[cfg(not(feature = "use-openssl"))]
-impl ProxySessionCast for https_rustls::session::Session {
-  fn as_http(&mut self) -> &mut http::Session { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session { self }
-}
-
-#[cfg(feature = "use-openssl")]
-impl ProxySessionCast for https_rustls::session::Session {
-  fn as_http(&mut self) -> &mut http::Session { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session { self }
-  fn as_https_openssl(&mut self) -> &mut https_openssl::Session { panic!() }
-}
-
-#[cfg(feature = "use-openssl")]
-impl ProxySessionCast for https_openssl::Session {
-  fn as_http(&mut self) -> &mut http::Session { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session { panic!() }
-  fn as_https_openssl(&mut self) -> &mut https_openssl::Session { self }
 }
 
