@@ -760,9 +760,98 @@ impl ProxySession for Session {
 
   fn connect_backend(&mut self, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let res = {
-      let proxy: Rc<RefCell<Proxy>> = self.proxy.upgrade().unwrap();
-      let res = {proxy.borrow_mut().connect_to_backend(self, back_token)};
-      res
+      let p: Rc<RefCell<Proxy>> = self.proxy.upgrade().unwrap();
+      let mut proxy = p.borrow_mut();
+
+      let old_app_id = self.http().and_then(|ref http| http.app_id.clone());
+      let old_back_token = self.back_token();
+
+      proxy.check_circuit_breaker(self)?;
+
+      let app_id = proxy.app_id_from_request(self)?;
+
+      if (self.http().and_then(|h| h.app_id.as_ref()) == Some(&app_id)) && self.back_connected == BackendConnectionStatus::Connected {
+        let has_backend = self.backend.as_ref().map(|backend| {
+            let ref backend = *backend.borrow();
+            proxy.backends.borrow().has_backend(&app_id, backend)
+          }).unwrap_or(false);
+
+        let is_valid_backend_socket = has_backend && self.http().map(|h| h.test_back_socket()).unwrap_or(false);
+
+        if is_valid_backend_socket {
+          //matched on keepalive
+          self.metrics.backend_id = self.backend.as_ref().map(|i| i.borrow().backend_id.clone());
+          self.metrics.backend_start();
+          return Ok(BackendConnectAction::Reuse);
+        } else {
+          if let Some(token) = self.back_token() {
+            self.close_backend(token, &mut proxy.poll.borrow_mut());
+
+            //reset the back token here so we can remove it
+            //from the slab after backend_from* fails
+            self.set_back_token(token);
+          }
+        }
+      }
+
+      //replacing with a connection to another application
+      if old_app_id.is_some() && old_app_id.as_ref() != Some(&app_id) {
+        if let Some(token) = self.back_token() {
+          self.close_backend(token, &mut proxy.poll.borrow_mut());
+
+          //reset the back token here so we can remove it
+          //from the slab after backend_from* fails
+          self.set_back_token(token);
+        }
+      }
+
+      self.app_id = Some(app_id.clone());
+
+      let sticky_session = self.http().and_then(|http| http.request.as_ref())
+        .and_then(|r| r.get_sticky_session());
+      let front_should_stick = proxy.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
+      let socket = proxy.backend_from_request(self, &app_id, front_should_stick, sticky_session)?;
+
+      self.http().map(|http| {
+        http.app_id = Some(app_id.clone());
+        http.reset_log_context();
+      });
+
+      if let Err(e) = socket.set_nodelay(true) {
+        error!("error setting nodelay on back socket({:?}): {:?}", socket, e);
+      }
+      self.back_readiness().map(|r| {
+        r.interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+      });
+
+      self.back_connected = BackendConnectionStatus::Connecting;
+      if let Some(back_token) = old_back_token {
+        self.set_back_token(back_token);
+        if let Err(e) = proxy.poll.borrow_mut().register(
+          &socket,
+          back_token,
+          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+          PollOpt::edge()
+        ) {
+          error!("error registering back socket({:?}): {:?}", socket, e);
+        }
+
+        self.set_back_socket(socket);
+        Ok(BackendConnectAction::Replace)
+      } else {
+        if let Err(e) = proxy.poll.borrow_mut().register(
+          &socket,
+          back_token,
+          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+          PollOpt::edge()
+        ) {
+          error!("error registering back socket({:?}): {:?}", socket, e);
+        }
+
+        self.set_back_socket(socket);
+        self.set_back_token(back_token);
+        Ok(BackendConnectAction::New)
+      }
     };
     res
   }
@@ -1354,14 +1443,14 @@ impl Proxy {
   }
 }
 
-impl ProxyConfiguration<Session> for Proxy {
+impl ProxyConfiguration for Proxy {
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
     self.listeners.get_mut(&Token(token.0)).unwrap().accept(token)
   }
 
   fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout,
     proxy: Weak<RefCell<Self>>)
-    -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
+    -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError> {
     if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
       if let Err(e) = frontend_sock.set_nodelay(true) {
         error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
@@ -1380,106 +1469,13 @@ impl ProxyConfiguration<Session> for Proxy {
           listener.config.public_address, listener.config.expect_proxy, listener.config.sticky_name.clone(),
           timeout, listener.answers.clone(), Token(token.0));
 
-        Ok((Rc::new(RefCell::new(c)), false))
+        Ok((Rc::new(RefCell::new(c)) as Rc<RefCell<dyn ProxySession>>, false))
       } else {
         error!("could not create ssl context");
         Err(AcceptError::IoError)
       }
     } else {
       Err(AcceptError::IoError)
-    }
-  }
-
-  fn connect_to_backend(&mut self, session: &mut Session, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
-    let old_app_id = session.http().and_then(|ref http| http.app_id.clone());
-    let old_back_token = session.back_token();
-
-    self.check_circuit_breaker(session)?;
-
-    let app_id = self.app_id_from_request(session)?;
-
-    if (session.http().and_then(|h| h.app_id.as_ref()) == Some(&app_id)) && session.back_connected == BackendConnectionStatus::Connected {
-      let has_backend = session.backend.as_ref().map(|backend| {
-         let ref backend = *backend.borrow();
-         self.backends.borrow().has_backend(&app_id, backend)
-        }).unwrap_or(false);
-
-      let is_valid_backend_socket = has_backend && session.http().map(|h| h.test_back_socket()).unwrap_or(false);
-
-      if is_valid_backend_socket {
-        //matched on keepalive
-        session.metrics.backend_id = session.backend.as_ref().map(|i| i.borrow().backend_id.clone());
-        session.metrics.backend_start();
-        return Ok(BackendConnectAction::Reuse);
-      } else {
-        if let Some(token) = session.back_token() {
-          session.close_backend(token, &mut self.poll.borrow_mut());
-
-          //reset the back token here so we can remove it
-          //from the slab after backend_from* fails
-          session.set_back_token(token);
-        }
-      }
-    }
-
-    //replacing with a connection to another application
-    if old_app_id.is_some() && old_app_id.as_ref() != Some(&app_id) {
-      if let Some(token) = session.back_token() {
-        session.close_backend(token, &mut self.poll.borrow_mut());
-
-        //reset the back token here so we can remove it
-        //from the slab after backend_from* fails
-        session.set_back_token(token);
-      }
-    }
-
-    session.app_id = Some(app_id.clone());
-
-    let sticky_session = session.http().and_then(|http| http.request.as_ref())
-      .and_then(|r| r.get_sticky_session());
-    let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-    let socket = self.backend_from_request(session, &app_id, front_should_stick, sticky_session)?;
-
-    session.http().map(|http| {
-      http.app_id = Some(app_id.clone());
-      http.reset_log_context();
-    });
-
-    if let Err(e) = socket.set_nodelay(true) {
-      error!("error setting nodelay on back socket({:?}): {:?}", socket, e);
-    }
-    session.back_readiness().map(|r| {
-      r.interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-    });
-
-
-    session.back_connected = BackendConnectionStatus::Connecting;
-    if let Some(back_token) = old_back_token {
-      session.set_back_token(back_token);
-      if let Err(e) = self.poll.borrow_mut().register(
-        &socket,
-        back_token,
-        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-        PollOpt::edge()
-      ) {
-        error!("error registering back socket({:?}): {:?}", socket, e);
-      }
-
-      session.set_back_socket(socket);
-      Ok(BackendConnectAction::Replace)
-    } else {
-      if let Err(e) = self.poll.borrow_mut().register(
-        &socket,
-        back_token,
-        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-        PollOpt::edge()
-      ) {
-        error!("error registering back socket({:?}): {:?}", socket, e);
-      }
-
-      session.set_back_socket(socket);
-      session.set_back_token(back_token);
-      Ok(BackendConnectAction::New)
     }
   }
 

@@ -683,9 +683,50 @@ impl ProxySession for Session {
 
   fn connect_backend(&mut self, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let res = {
-      let proxy: Rc<RefCell<Proxy>> = self.proxy.upgrade().unwrap();
-      let res = {proxy.borrow_mut().connect_to_backend(self, back_token)};
-      res
+      let p: Rc<RefCell<Proxy>> = self.proxy.upgrade().unwrap();
+      let mut proxy = p.borrow_mut();
+
+      if proxy.listeners[&self.accept_token].app_id.is_none() {
+        error!("no TCP application corresponds to that front address");
+        return Err(ConnectionError::HostNotFound);
+      }
+
+      let app_id = proxy.listeners[&self.accept_token].app_id.clone();
+      self.app_id = app_id.clone();
+      let app_id = app_id.unwrap();
+
+
+      if self.connection_attempt == CONN_RETRIES {
+        error!("{} max connection attempt reached", self.log_context());
+        return Err(ConnectionError::NoBackendAvailable)
+      }
+
+      let conn = proxy.backend_from_app_id(self, &app_id);
+      match conn {
+        Ok(stream) => {
+          if let Err(e) = stream.set_nodelay(true) {
+            error!("error setting nodelay on back socket({:?}): {:?}", stream, e);
+          }
+          self.back_connected = BackendConnectionStatus::Connecting;
+
+          if let Err(e) = proxy.poll.borrow_mut().register(
+            &stream,
+            back_token,
+            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+            PollOpt::edge()
+          ) {
+            error!("error registering back socket({:?}): {:?}", stream, e);
+          }
+
+          self.set_back_token(back_token);
+          self.set_back_socket(stream);
+          Ok(BackendConnectAction::New)
+        },
+        Err(ConnectionError::NoBackendAvailable) => Err(ConnectionError::NoBackendAvailable),
+        Err(e) => {
+          panic!("tcp connect_to_backend: unexpected error: {:?}", e);
+        }
+      }
     };
     res
   }
@@ -875,52 +916,7 @@ impl Proxy {
   }
 }
 
-impl ProxyConfiguration<Session> for Proxy {
-
-  fn connect_to_backend(&mut self, session: &mut Session, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
-    if self.listeners[&session.accept_token].app_id.is_none() {
-      error!("no TCP application corresponds to that front address");
-      return Err(ConnectionError::HostNotFound);
-    }
-
-    let app_id = self.listeners[&session.accept_token].app_id.clone();
-    session.app_id = app_id.clone();
-    let app_id = app_id.unwrap();
-
-
-    if session.connection_attempt == CONN_RETRIES {
-      error!("{} max connection attempt reached", session.log_context());
-      return Err(ConnectionError::NoBackendAvailable)
-    }
-
-    let conn = self.backend_from_app_id(session, &app_id);
-    match conn {
-      Ok(stream) => {
-        if let Err(e) = stream.set_nodelay(true) {
-          error!("error setting nodelay on back socket({:?}): {:?}", stream, e);
-        }
-        session.back_connected = BackendConnectionStatus::Connecting;
-
-        if let Err(e) = self.poll.borrow_mut().register(
-          &stream,
-          back_token,
-          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-          PollOpt::edge()
-        ) {
-          error!("error registering back socket({:?}): {:?}", stream, e);
-        }
-
-        session.set_back_token(back_token);
-        session.set_back_socket(stream);
-        Ok(BackendConnectAction::New)
-      },
-      Err(ConnectionError::NoBackendAvailable) => Err(ConnectionError::NoBackendAvailable),
-      Err(e) => {
-        panic!("tcp connect_to_backend: unexpected error: {:?}", e);
-      }
-    }
-  }
-
+impl ProxyConfiguration for Proxy {
   fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
     match message.order {
       ProxyRequestData::AddTcpFront(front) => {
@@ -1007,7 +1003,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
   fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout,
     proxy: Weak<RefCell<Self>>)
-    -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
+    -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError> {
     let internal_token = Token(token.0);
     if let Some(listener) = self.listeners.get_mut(&internal_token) {
       let mut p = (*listener.pool).borrow_mut();
@@ -1039,7 +1035,7 @@ impl ProxyConfiguration<Session> for Proxy {
         }
 
         let should_connect_backend = proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
-        Ok((Rc::new(RefCell::new(c)), should_connect_backend))
+        Ok((Rc::new(RefCell::new(c)) as Rc<RefCell<dyn ProxySession>>, should_connect_backend))
       } else {
         error!("could not get buffers from pool");
         Err(AcceptError::TooManySessions)

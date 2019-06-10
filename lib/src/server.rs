@@ -925,7 +925,7 @@ impl Server {
     }
   }
 
-  pub fn create_session_tcp(&mut self, token: ListenToken, socket: TcpStream) -> bool {
+  pub fn create_session_wrapper(&mut self, token: ListenToken, socket: TcpStream, protocol: Protocol) -> bool {
     if self.nb_connections == self.max_connections {
       error!("max number of session connection reached, flushing the accept queue");
       self.can_accept = false;
@@ -945,14 +945,31 @@ impl Server {
         let session_token = Token(entry.index().0);
         let index = entry.index();
         let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
-        let tcp = Rc::downgrade(&self.tcp);
-        match self.tcp.borrow_mut().create_session(socket, token, session_token, timeout, tcp) {
+
+        let res = match protocol {
+          Protocol::TCPListen   => {
+            let tcp = Rc::downgrade(&self.tcp);
+            self.tcp.borrow_mut().create_session(socket, token, session_token, timeout, tcp)
+          },
+          Protocol::HTTPListen  => {
+            let http = Rc::downgrade(&self.http);
+
+            self.http.borrow_mut().create_session(socket, token, session_token, timeout, http)
+          },
+          Protocol::HTTPSListen => {
+            self.https.create_session(socket, token, session_token, timeout)
+          },
+          _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
+        };
+
+        match res {
           Ok((session, should_connect)) => {
             entry.insert(session);
             self.nb_connections += 1;
             assert!(self.nb_connections <= self.max_connections);
             gauge!("client.connections", self.nb_connections);
 
+            // specific to TCP, otherwise just return true
             if should_connect {
               index
             } else {
@@ -980,96 +997,6 @@ impl Server {
     true
   }
 
-  pub fn create_session_http(&mut self, token: ListenToken, socket: TcpStream) -> bool {
-    if self.nb_connections == self.max_connections {
-      error!("max number of session connection reached, flushing the accept queue");
-      self.can_accept = false;
-      return false;
-    }
-
-    //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
-    match self.sessions.vacant_entry() {
-      None => {
-        error!("not enough memory to accept another session, flushing the accept queue");
-        error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
-        self.can_accept = false;
-        false
-      },
-      Some(entry) => {
-        let session_token = Token(entry.index().0);
-        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
-        let http = Rc::downgrade(&self.http);
-
-        match self.http.borrow_mut().create_session(socket, token, session_token, timeout, http) {
-          Ok((session, _)) => {
-            entry.insert(session);
-            self.nb_connections += 1;
-            assert!(self.nb_connections <= self.max_connections);
-            gauge!("client.connections", self.nb_connections);
-            true
-          },
-          Err(AcceptError::IoError) => {
-            //FIXME: do we stop accepting?
-            false
-          },
-          Err(AcceptError::WouldBlock) => {
-            self.accept_ready.remove(&token);
-            false
-          },
-          Err(AcceptError::TooManySessions) => {
-            error!("max number of session connection reached, flushing the accept queue");
-            self.can_accept = false;
-            false
-          }
-        }
-      }
-    }
-  }
-
-  pub fn create_session_https(&mut self, token: ListenToken, socket: TcpStream) -> bool {
-    if self.nb_connections == self.max_connections {
-      error!("max number of session connection reached, flushing the accept queue");
-      self.can_accept = false;
-      return false;
-    }
-
-    //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
-    match self.sessions.vacant_entry() {
-      None => {
-        error!("not enough memory to accept another session, flushing the accept queue");
-        error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
-        self.can_accept = false;
-        false
-      },
-      Some(entry) => {
-        let session_token = Token(entry.index().0);
-        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
-
-        match self.https.create_session(socket, token, session_token, timeout) {
-          Ok((session, _)) => {
-            entry.insert(session);
-            self.nb_connections += 1;
-            assert!(self.nb_connections <= self.max_connections);
-            gauge!("client.connections", self.nb_connections);
-            true
-          },
-          Err(AcceptError::IoError) => {
-            //FIXME: do we stop accepting?
-            false
-          },
-          Err(AcceptError::WouldBlock) => {
-            self.accept_ready.remove(&token);
-            false
-          },
-          Err(AcceptError::TooManySessions) => {
-            error!("max number of session connection reached, flushing the accept queue");
-            self.can_accept = false;
-            false
-          }
-        }
-      }
-    }
-  }
 
   pub fn accept(&mut self, token: ListenToken, protocol: Protocol) {
     match protocol {
@@ -1136,24 +1063,9 @@ impl Server {
           incr!("accept_queue.timeout");
           continue;
         }
-        //FIXME: check the timestamp
-        match protocol {
-          Protocol::TCPListen   => {
-            if !self.create_session_tcp(token, sock) {
-              break;
-            }
-          },
-          Protocol::HTTPListen  => {
-            if !self.create_session_http(token, sock) {
-              break;
-            }
-          },
-          Protocol::HTTPSListen => {
-            if !self.create_session_https(token, sock) {
-              break;
-            }
-          },
-          _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
+
+        if !self.create_session_wrapper(token, sock, protocol) {
+          break;
         }
       } else {
         break;
@@ -1494,26 +1406,6 @@ impl HttpsProvider {
     }
   }
 
-  pub fn connect_to_backend(&mut self, proxy_session: Rc<RefCell<dyn ProxySession>>, back_token: Token)
-    -> Result<BackendConnectAction, ConnectionError> {
-
-      unimplemented!()
-  /*
-    match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => {
-        let mut b = proxy_session.borrow_mut();
-        let session: &mut https_rustls::session::Session = b.as_https_rustls();
-        rustls.borrow_mut().connect_to_backend(session, back_token)
-      },
-      &mut HttpsProvider::Openssl(ref mut openssl) => {
-        let mut b = proxy_session.borrow_mut();
-        let session: &mut https_openssl::Session = b.as_https_openssl();
-        openssl.borrow_mut().connect_to_backend(session, back_token)
-      }
-    }
-    */
-
-  }
 }
 
 #[cfg(not(feature = "use-openssl"))]
@@ -1562,22 +1454,9 @@ impl HttpsProvider {
     rustls.borrow_mut().accept(token)
   }
 
-  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<Session>>,bool), AcceptError> {
+  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<dyn ProxySession>>,bool), AcceptError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
     let proxy = Rc::downgrade(rustls);
     rustls.borrow_mut().create_session(frontend_sock, token, session_token, timeout, proxy)
   }
-
-  pub fn connect_to_backend(&mut self,  proxy_session: Rc<RefCell<dyn ProxySession>>, back_token: Token)
-    -> Result<BackendConnectAction, ConnectionError> {
-    unimplemented!()
-    /*
-    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-
-    let mut b = proxy_session.borrow_mut();
-    let session: &mut https_rustls::session::Session = b.as_https_rustls() ;
-    rustls.borrow_mut().connect_to_backend(session, back_token)
-    */
-  }
 }
-

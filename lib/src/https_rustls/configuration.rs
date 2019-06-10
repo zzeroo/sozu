@@ -26,8 +26,7 @@ use sozu_command::buffer::Buffer;
 
 use protocol::http::{parser::{RRequestLine,hostname_and_port}, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
 use pool::Pool;
-use {AppId,ConnectionError,Protocol,
-  ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
+use {AppId,ConnectionError,Protocol,ProxySession,ProxyConfiguration,AcceptError,};
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
 use socket::{server_bind, server_unbind};
@@ -234,11 +233,11 @@ impl Listener {
 }
 
 pub struct Proxy {
-  listeners:      HashMap<Token, Listener>,
-  applications:   HashMap<AppId, Application>,
-  backends:       Rc<RefCell<BackendMap>>,
-  pool:           Rc<RefCell<Pool<Buffer>>>,
-  poll:           Rc<RefCell<Poll>>,
+  listeners:        HashMap<Token, Listener>,
+  pub applications: HashMap<AppId, Application>,
+  pub backends:     Rc<RefCell<BackendMap>>,
+  pool:             Rc<RefCell<Pool<Buffer>>>,
+  pub poll:         Rc<RefCell<Poll>>,
 }
 
 impl Proxy {
@@ -364,7 +363,7 @@ impl Proxy {
     }
   }
 
-  fn app_id_from_request(&mut self, session: &mut Session) -> Result<String, ConnectionError> {
+  pub fn app_id_from_request(&mut self, session: &mut Session) -> Result<String, ConnectionError> {
     let h = session.http().and_then(|h| h.request.as_ref()).and_then(|r| r.get_host()).ok_or(ConnectionError::NoHostGiven)?;
 
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
@@ -418,7 +417,7 @@ impl Proxy {
     }
   }
 
-  fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
+  pub fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
     if session.connection_attempt == CONN_RETRIES {
       error!("{} max connection attempt reached", session.log_context());
       let answer = self.get_service_unavailable_answer(session.app_id.as_ref().map(|app_id| app_id.as_str()), &session.listen_token);
@@ -434,14 +433,14 @@ impl Proxy {
   }
 }
 
-impl ProxyConfiguration<Session> for Proxy {
+impl ProxyConfiguration for Proxy {
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
     self.listeners.get_mut(&Token(token.0)).unwrap().accept(token)
   }
 
   fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout,
     proxy: Weak<RefCell<Self>>)
-    -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
+    -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError> {
 
       if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
         if let Err(e) = frontend_sock.set_nodelay(true) {
@@ -463,101 +462,11 @@ impl ProxyConfiguration<Session> for Proxy {
           listener.config.expect_proxy, listener.config.sticky_name.clone(),
           timeout, listener.answers.clone(), Token(token.0));
 
-        Ok((Rc::new(RefCell::new(c)), false))
+        Ok((Rc::new(RefCell::new(c)) as Rc<RefCell<dyn ProxySession>>, false))
       } else {
         //FIXME
         Err(AcceptError::IoError)
       }
-    }
-
-  fn connect_to_backend(&mut self, session: &mut Session, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
-    let old_app_id = session.http().and_then(|ref http| http.app_id.clone());
-    let old_back_token = session.back_token();
-
-    self.check_circuit_breaker(session)?;
-
-    let app_id = self.app_id_from_request(session)?;
-
-    if (session.http().and_then(|h| h.app_id.as_ref()) == Some(&app_id)) && session.back_connected == BackendConnectionStatus::Connected {
-      let has_backend = session.backend.as_ref().map(|backend| {
-         let ref backend = *backend.borrow();
-         self.backends.borrow().has_backend(&app_id, backend)
-        }).unwrap_or(false);
-      let is_valid_backend_socket = has_backend && session.http().map(|h| h.test_back_socket()).unwrap_or(false);
-
-      if is_valid_backend_socket {
-        //matched on keepalive
-        session.metrics.backend_id = session.backend.as_ref().map(|i| i.borrow().backend_id.clone());
-        session.metrics.backend_start();
-        return Ok(BackendConnectAction::Reuse);
-      } else if let Some(token) = session.back_token() {
-        session.close_backend(token, &mut self.poll.borrow_mut());
-
-        //reset the back token here so we can remove it
-        //from the slab after backend_from* fails
-        session.set_back_token(token);
-      }
-    }
-
-    if old_app_id.is_some() && old_app_id.as_ref() != Some(&app_id) {
-      if let Some(token) = session.back_token() {
-        session.close_backend(token, &mut self.poll.borrow_mut());
-
-        //reset the back token here so we can remove it
-        //from the slab after backend_from* fails
-        session.set_back_token(token);
-      }
-    }
-
-    session.app_id = Some(app_id.clone());
-
-    let sticky_session = session.http()
-      .and_then(|http| http.request.as_ref())
-      .and_then(|r| r.get_sticky_session());
-    let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-    let socket = self.backend_from_request(session, &app_id, front_should_stick, sticky_session)?;
-
-    session.http().map(|http| {
-      http.app_id = Some(app_id.clone());
-      http.reset_log_context();
-    });
-
-    // we still want to use the new socket
-    if let Err(e) = socket.set_nodelay(true) {
-      error!("error setting nodelay on back socket: {:?}", e);
-    }
-    session.back_readiness().map(|r| {
-      r.interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-    });
-
-    session.back_connected = BackendConnectionStatus::Connecting;
-    if let Some(back_token) = old_back_token {
-      session.set_back_token(back_token);
-      if let Err(e) = self.poll.borrow_mut().register(
-        &socket,
-        back_token,
-        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-        PollOpt::edge()
-      ) {
-        error!("error registering back socket: {:?}", e);
-      }
-
-      session.set_back_socket(socket);
-      Ok(BackendConnectAction::Replace)
-    } else {
-      if let Err(e) = self.poll.borrow_mut().register(
-        &socket,
-        back_token,
-        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-        PollOpt::edge()
-      ) {
-        error!("error registering back socket: {:?}", e);
-      }
-
-      session.set_back_socket(socket);
-      session.set_back_token(back_token);
-      Ok(BackendConnectAction::New)
-    }
   }
 
   fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
