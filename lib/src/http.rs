@@ -16,7 +16,7 @@ use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,
-  ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent,RemoveListener};
+  ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent,ListenerType};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -26,9 +26,9 @@ use super::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,Sessi
 use super::backends::BackendMap;
 use super::pool::Pool;
 use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
-use super::protocol::http::{DefaultAnswerStatus, TimeoutStatus, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
+use super::protocol::http::{DefaultAnswerStatus, TimeoutStatus, answers::HttpAnswers};
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
+use super::server::{Server,ProxyChannel,SessionToken,
   ListenSession, CONN_RETRIES, push_event};
 use super::socket::{server_bind,server_unbind};
 use super::retry::RetryPolicy;
@@ -53,7 +53,7 @@ pub struct Session {
   backend:            Option<Rc<RefCell<Backend>>>,
   back_connected:     BackendConnectionStatus,
   protocol:           Option<State>,
-  proxy:              Weak<RefCell<Proxy>>,
+  listener:           ListenerWrapper,
   pool:               Weak<RefCell<Pool<Buffer>>>,
   metrics:            SessionMetrics,
   pub app_id:         Option<String>,
@@ -66,7 +66,7 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(sock: TcpStream, token: Token, proxy: Weak<RefCell<Proxy>>, pool: Weak<RefCell<Pool<Buffer>>>,
+  pub fn new(sock: TcpStream, token: Token, listener: ListenerWrapper, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Option<Session> {
     let request_id = Uuid::new_v4().to_hyphenated();
@@ -86,7 +86,7 @@ impl Session {
         back_connected:     BackendConnectionStatus::NotConnected,
         protocol:           Some(pr),
         frontend_token:     token,
-        proxy,
+        listener,
         pool,
         metrics:            SessionMetrics::new(),
         app_id:             None,
@@ -689,21 +689,21 @@ impl ProxySession for Session {
 
   fn connect_backend(&mut self, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let res = {
-      let p: Rc<RefCell<Proxy>> = self.proxy.upgrade().unwrap();
-      let mut proxy = p.borrow_mut();
+      let l = self.listener.inner.clone();
+      let mut listener = l.borrow_mut();
 
       let old_app_id = self.http().and_then(|ref http| http.app_id.clone());
       let old_back_token = self.back_token();
 
-      proxy.check_circuit_breaker(self)?;
+      listener.check_circuit_breaker(self)?;
 
-      let app_id = proxy.app_id_from_request(self)?;
+      let app_id = listener.app_id_from_request(self)?;
 
       if (self.http().and_then(|h| h.app_id.as_ref()) == Some(&app_id)) && self.back_connected == BackendConnectionStatus::Connected {
 
         let has_backend = self.backend.as_ref().map(|backend| {
             let ref backend = *backend.borrow();
-            proxy.backends.borrow().has_backend(&app_id, backend)
+            listener.proxy.borrow().backends.borrow().has_backend(&app_id, backend)
           }).unwrap_or(false);
 
         let is_valid_backend_socket = has_backend && self.http().map(|h| h.test_back_socket()).unwrap_or(false);
@@ -714,7 +714,7 @@ impl ProxySession for Session {
           self.metrics.backend_start();
           return Ok(BackendConnectAction::Reuse);
         } else if let Some(token) = self.back_token() {
-          self.close_backend(token, &mut proxy.poll.borrow_mut());
+          self.close_backend(token, &mut listener.poll.borrow_mut());
 
           //reset the back token here so we can remove it
           //from the slab after backend_from* fails
@@ -725,7 +725,7 @@ impl ProxySession for Session {
       //replacing with a connection to another application
       if old_app_id.is_some() && old_app_id.as_ref() != Some(&app_id) {
         if let Some(token) = self.back_token() {
-          self.close_backend(token, &mut proxy.poll.borrow_mut());
+          self.close_backend(token, &mut listener.poll.borrow_mut());
 
           //reset the back token here so we can remove it
           //from the slab after backend_from* fails
@@ -738,8 +738,8 @@ impl ProxySession for Session {
       let sticky_session = self.http()
         .and_then(|http| http.request.as_ref())
         .and_then(|r| r.get_sticky_session());
-      let front_should_stick = proxy.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-      let socket = proxy.backend_from_request(self, &app_id, front_should_stick, sticky_session)?;
+      let front_should_stick = listener.proxy.borrow_mut().applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
+      let socket = listener.backend_from_request(self, &app_id, front_should_stick, sticky_session)?;
 
       self.http().map(|http| {
         http.app_id = Some(app_id.clone());
@@ -756,7 +756,7 @@ impl ProxySession for Session {
       self.back_connected = BackendConnectionStatus::Connecting;
       if let Some(back_token) = old_back_token {
         self.set_back_token(back_token);
-        if let Err(e) = proxy.poll.borrow_mut().register(
+        if let Err(e) = listener.poll.borrow_mut().register(
           &socket,
           back_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
@@ -767,7 +767,7 @@ impl ProxySession for Session {
         self.set_back_socket(socket);
         Ok(BackendConnectAction::Replace)
       } else {
-        if let Err(e) = proxy.poll.borrow_mut().register(
+        if let Err(e) = listener.poll.borrow_mut().register(
           &socket,
           back_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
@@ -796,20 +796,20 @@ pub struct Listener {
   config:         HttpListener,
   pub token:      Token,
   pub active:     bool,
+  pub proxy:      Rc<RefCell<Proxy>>,
+  poll:           Rc<RefCell<Poll>>,
 }
 
 pub struct Proxy {
-  listeners:     HashMap<Token,Listener>,
-  backends:      Rc<RefCell<BackendMap>>,
-  applications:  HashMap<AppId, Application>,
-  pool:          Rc<RefCell<Pool<Buffer>>>,
-  poll:          Rc<RefCell<Poll>>,
+  backends:     Rc<RefCell<BackendMap>>,
+  applications: HashMap<AppId, Application>,
+  pool:         Rc<RefCell<Pool<Buffer>>>,
+  poll:         Rc<RefCell<Poll>>,
 }
 
 impl Proxy {
   pub fn new(pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>, poll: Rc<RefCell<Poll>>) -> Proxy {
     Proxy {
-      listeners:      HashMap::new(),
       applications:   HashMap::new(),
       backends,
       pool,
@@ -817,67 +817,21 @@ impl Proxy {
     }
   }
 
-  pub fn add_listener(&mut self, config: HttpListener, token: Token) -> Option<Token> {
-    if self.listeners.contains_key(&token) {
-      None
-    } else {
-     let listener = Listener::new(config, token);
-      self.listeners.insert(listener.token, listener);
-      Some(token)
-    }
-  }
-
-  pub fn remove_listener(&mut self, remove: RemoveListener) -> bool {
-    let token = self.listeners.iter()
-      .find(|(_, listener)| listener.address == remove.front)
-      .and_then(|(token, listener)| {
-        match listener.active {
-          false => Some(token.clone()),
-          true => {
-            error!("Listener {:?} is still active, not removing", listener.address);
-            None
-          }
-        }
-      });
-
-    if let Some(t) = token {
-      self.listeners.remove_entry(&t);
-      return true;
-    } else {
-      return false;
-    }
-  }
-
-  pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
-    for listener in self.listeners.values_mut() {
-      if &listener.address == addr {
-        return listener.activate(event_loop, tcp_listener);
-      }
-    }
-    None
-  }
-
-  pub fn deactivate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr) -> Option<TcpListener> {
-    for listener in self.listeners.values_mut() {
-      if &listener.address == addr {
-        return listener.deactivate(event_loop);
-      }
-    }
-    None
-  }
-
-  pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
-    self.listeners.values_mut().filter(|l| l.listener.is_some()).map(|l| {
-      (l.address, l.listener.take().unwrap())
-    }).collect()
+  pub fn add_listener(&mut self, config: HttpListener, token: Token, proxy: Rc<RefCell<Proxy>>) -> Option<ListenerWrapper> {
+    let poll = self.poll.clone();
+    let listener = ListenerWrapper::new(Listener::new(config, token, proxy, poll));
+    Some(listener)
   }
 
   pub fn add_application(&mut self, mut application: Application) {
+    /*
     if let Some(answer_503) = application.answer_503.as_ref() {
       for l in self.listeners.values_mut() {
         l.answers.borrow_mut().add_custom_answer(&application.app_id, &answer_503);
       }
     }
+    */
+    error!("FIXME ADD_APPLICATION ANSWERS");
 
     self.applications.insert(application.app_id.clone(), application);
   }
@@ -885,121 +839,19 @@ impl Proxy {
   pub fn remove_application(&mut self, app_id: &str) {
     self.applications.remove(app_id);
 
+    error!("FIXME REMOVE_APPLICATION ANSWERS");
+
+    /*
     for l in self.listeners.values_mut() {
       l.answers.borrow_mut().remove_custom_answer(app_id);
     }
-  }
-
-  pub fn backend_from_request(&mut self, session: &mut Session, app_id: &str,
-  front_should_stick: bool, sticky_session: Option<String>) -> Result<TcpStream,ConnectionError> {
-    session.http().map(|h| h.set_app_id(String::from(app_id)));
-
-    let res = match (front_should_stick, sticky_session) {
-      (true, Some(sticky_session)) => {
-        self.backends.borrow_mut().backend_from_sticky_session(app_id, &sticky_session)
-          .map_err(|e| {
-            debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-            e
-          })
-      },
-      _ => self.backends.borrow_mut().backend_from_app_id(app_id),
-    };
-
-    match res {
-      Err(e) => {
-        let answer = self.get_service_unavailable_answer(Some(app_id), session.listen_token);
-        session.set_answer(DefaultAnswerStatus::Answer503, answer);
-        Err(e)
-      },
-      Ok((backend, conn))  => {
-        if front_should_stick {
-          let sticky_name =  self.listeners[&session.listen_token].config.sticky_name.clone();
-          session.http().map(|http| {
-            http.sticky_session =
-              Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or_else(|| {
-                backend.borrow().backend_id.clone()})));
-            http.sticky_name = sticky_name;
-          });
-        }
-        session.metrics.backend_id = Some(backend.borrow().backend_id.clone());
-        session.metrics.backend_start();
-        session.backend = Some(backend);
-
-        Ok(conn)
-      }
-    }
-  }
-
-  fn app_id_from_request(&mut self, session: &mut Session) -> Result<String, ConnectionError> {
-    let h = session.http().and_then(|h| h.request.as_ref())
-      .and_then(|s| s.get_host()).ok_or(ConnectionError::NoHostGiven)?;
-
-    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
-      if i != &b""[..] {
-        error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
-        session.set_answer(DefaultAnswerStatus::Answer400, answer);
-        return Err(ConnectionError::InvalidHost);
-      }
-
-      //FIXME: we should check that the port is right too
-
-      if port == Some(&b"80"[..]) {
-      // it is alright to call from_utf8_unchecked,
-      // we already verified that there are only ascii
-      // chars in there
-        unsafe { from_utf8_unchecked(hostname) }
-      } else {
-        &h
-      }
-    } else {
-      error!("hostname parsing failed for: '{}'", h);
-      let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
-      session.set_answer(DefaultAnswerStatus::Answer400, answer);
-      return Err(ConnectionError::InvalidHost);
-    };
-
-    let rl = session.http().and_then(|h| h.request.as_ref())
-      .and_then(|s| s.get_request_line()).ok_or(ConnectionError::NoRequestLineGiven)?;
-
-    let app_id = match self.listeners.get(&session.listen_token).as_ref()
-      .and_then(|l| l.frontend_from_request(&host, &rl.uri)) {
-      Some(app_id) => app_id,
-      None => {
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
-        session.set_answer(DefaultAnswerStatus::Answer404, answer);
-        return Err(ConnectionError::HostNotFound);
-      }
-    };
-
-    let front_should_redirect_https = self.applications.get(&app_id).map(|ref app| app.https_redirect).unwrap_or(false);
-    if front_should_redirect_https {
-      let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, rl.uri);
-      session.set_answer(DefaultAnswerStatus::Answer301, Rc::new(answer.into_bytes()));
-      return Err(ConnectionError::HttpsRedirect);
-    }
-
-    Ok(app_id)
-  }
-
-  fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
-    if session.connection_attempt == CONN_RETRIES {
-      error!("{} max connection attempt reached", session.log_context());
-      let answer = self.get_service_unavailable_answer(session.app_id.as_ref().map(|app_id| app_id.as_str()), session.listen_token);
-      session.set_answer(DefaultAnswerStatus::Answer503, answer);
-      Err(ConnectionError::NoBackendAvailable)
-    } else {
-      Ok(())
-    }
-  }
-
-  fn get_service_unavailable_answer(&self, app_id: Option<&str>, listen_token: Token) -> Rc<Vec<u8>> {
-    self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer503, app_id)
+    */
   }
 }
 
 impl Listener {
-  pub fn new(config: HttpListener, token: Token) -> Listener {
+  pub fn new(config: HttpListener, token: Token, proxy: Rc<RefCell<Proxy>>, poll: Rc<RefCell<Poll>>) -> Listener {
+
     Listener {
       listener: None,
       address: config.front,
@@ -1008,10 +860,12 @@ impl Listener {
       config,
       token,
       active: false,
+      proxy,
+      poll,
     }
   }
 
-  pub fn activate(&mut self, event_loop: &mut Poll, tcp_listener: Option<TcpListener>) -> Option<Token> {
+  pub fn activate(&mut self, tcp_listener: Option<TcpListener>) -> Option<Token> {
     if self.active {
       return None;
     }
@@ -1021,7 +875,7 @@ impl Listener {
     }).ok());
 
     if let Some(ref sock) = listener {
-      if let Err(e) = event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge()) {
+      if let Err(e) = self.poll.borrow_mut().register(sock, self.token, Ready::readable(), PollOpt::edge()) {
         error!("error registering listener socket({:?}): {:?}", sock, e);
       }
     } else {
@@ -1033,13 +887,13 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn deactivate(&mut self, event_loop: &mut Poll) -> Option<TcpListener> {
+  pub fn deactivate(&mut self) -> Option<TcpListener> {
     if !self.active {
       return None;
     }
 
     if let Some(listener) = self.listener.take() {
-      if let Err(e) = event_loop.deregister(&listener) {
+      if let Err(e) = self.poll.borrow_mut().deregister(&listener) {
         error!("error deregistering socket({:?}: {:?})", listener, e);
         self.listener = Some(listener);
         return None;
@@ -1098,7 +952,7 @@ impl Listener {
     self.fronts.lookup(host.as_bytes(), uri.as_bytes())
   }
 
-  fn accept(&mut self) -> Result<TcpStream, AcceptError> {
+  fn accept(&self) -> Result<TcpStream, AcceptError> {
 
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
@@ -1114,6 +968,216 @@ impl Listener {
       error!("cannot accept connections, no listening socket available");
       Err(AcceptError::IoError)
     }
+  }
+
+  fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
+    if session.connection_attempt == CONN_RETRIES {
+      error!("{} max connection attempt reached", session.log_context());
+      let answer = self.get_service_unavailable_answer(session.app_id.as_ref().map(|app_id| app_id.as_str()));
+      session.set_answer(DefaultAnswerStatus::Answer503, answer);
+      Err(ConnectionError::NoBackendAvailable)
+    } else {
+      Ok(())
+    }  }
+
+  fn get_service_unavailable_answer(&self, app_id: Option<&str>) -> Rc<Vec<u8>> {
+    self.answers.borrow().get(DefaultAnswerStatus::Answer503, app_id)
+  }
+
+  fn app_id_from_request(&mut self, session: &mut Session) -> Result<String, ConnectionError> {
+    let h = session.http().and_then(|h| h.request.as_ref())
+      .and_then(|s| s.get_host()).ok_or(ConnectionError::NoHostGiven)?;
+
+    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
+      if i != &b""[..] {
+        error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
+        let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer400, None);
+        session.set_answer(DefaultAnswerStatus::Answer400, answer);
+        return Err(ConnectionError::InvalidHost);
+      }
+
+      //FIXME: we should check that the port is right too
+
+      if port == Some(&b"80"[..]) {
+      // it is alright to call from_utf8_unchecked,
+      // we already verified that there are only ascii
+      // chars in there
+        unsafe { from_utf8_unchecked(hostname) }
+      } else {
+        &h
+      }
+    } else {
+      error!("hostname parsing failed for: '{}'", h);
+      let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer400, None);
+      session.set_answer(DefaultAnswerStatus::Answer400, answer);
+      return Err(ConnectionError::InvalidHost);
+    };
+
+    let rl = session.http().and_then(|h| h.request.as_ref())
+      .and_then(|s| s.get_request_line()).ok_or(ConnectionError::NoRequestLineGiven)?;
+
+    let app_id = match self.frontend_from_request(&host, &rl.uri) {
+      Some(app_id) => app_id,
+      None => {
+        let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer404, None);
+        session.set_answer(DefaultAnswerStatus::Answer404, answer);
+        return Err(ConnectionError::HostNotFound);
+      }
+    };
+
+    let front_should_redirect_https = self.proxy.borrow().applications.get(&app_id).map(|ref app| app.https_redirect).unwrap_or(false);
+    if front_should_redirect_https {
+      let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, rl.uri);
+      session.set_answer(DefaultAnswerStatus::Answer301, Rc::new(answer.into_bytes()));
+      return Err(ConnectionError::HttpsRedirect);
+    }
+
+    Ok(app_id)
+  }
+
+  fn create_session(&self, frontend_sock: TcpStream, session_token: Token, timeout: Timeout,
+    wrapper: ListenerWrapper)
+  -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError> {
+    if let Err(e) = frontend_sock.set_nodelay(true) {
+      error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
+    }
+
+    let pool = Rc::downgrade(&self.proxy.borrow().pool);
+    if let Some(c) = Session::new(frontend_sock, session_token, wrapper, pool,
+    self.config.public_address, self.config.expect_proxy, self.config.sticky_name.clone(), timeout,
+    self.answers.clone(), self.token) {
+      if let Err(e) = self.poll.borrow_mut().register(
+        c.front_socket(),
+        session_token,
+        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+        PollOpt::edge()
+        ) {
+          error!("error deregistering listen socket({:?}): {:?}", c.front_socket(), e);
+        }
+
+      Ok((Rc::new(RefCell::new(c)) as Rc<RefCell<dyn ProxySession>>, false))
+    } else {
+      Err(AcceptError::TooManySessions)
+    }
+  }
+
+  pub fn backend_from_request(&mut self, session: &mut Session, app_id: &str,
+  front_should_stick: bool, sticky_session: Option<String>) -> Result<TcpStream,ConnectionError> {
+    session.http().map(|h| h.set_app_id(String::from(app_id)));
+
+    let res = match (front_should_stick, sticky_session) {
+      (true, Some(sticky_session)) => {
+        self.proxy.borrow().backends.borrow_mut().backend_from_sticky_session(app_id, &sticky_session)
+          .map_err(|e| {
+            debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
+            e
+          })
+      },
+      _ => self.proxy.borrow().backends.borrow_mut().backend_from_app_id(app_id),
+    };
+
+    match res {
+      Err(e) => {
+        let answer = self.get_service_unavailable_answer(Some(app_id));
+        session.set_answer(DefaultAnswerStatus::Answer503, answer);
+        Err(e)
+      },
+      Ok((backend, conn))  => {
+        if front_should_stick {
+          let sticky_name =  self.config.sticky_name.clone();
+          session.http().map(|http| {
+            http.sticky_session =
+              Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or_else(|| {
+                backend.borrow().backend_id.clone()})));
+            http.sticky_name = sticky_name;
+          });
+        }
+        session.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        session.metrics.backend_start();
+        session.backend = Some(backend);
+
+        Ok(conn)
+      }
+    }
+  }
+}
+
+#[derive(Clone)]
+pub struct ListenerWrapper {
+  pub inner: Rc<RefCell<Listener>>,
+}
+
+impl ListenerWrapper {
+  fn new(l: Listener) -> Self {
+    ListenerWrapper {
+      inner: Rc::new(RefCell::new(l)),
+    }
+  }
+}
+
+impl super::Listener for ListenerWrapper {
+  fn address(&self) -> SocketAddr {
+    self.inner.borrow().address
+  }
+
+  fn active(&self) -> bool {
+    self.inner.borrow().active
+  }
+
+  fn notify(&self, message: ProxyRequest) -> ProxyResponse {
+    // ToDo temporary
+    //trace!("{} notified", message);
+    match message.order {
+      ProxyRequestData::AddHttpFront(front) => {
+        debug!("{} add front {:?}", message.id, front);
+        match self.inner.borrow_mut().add_http_front(front) {
+          Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+          Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err), data: None }
+        }
+      },
+      ProxyRequestData::RemoveHttpFront(front) => {
+        debug!("{} front {:?}", message.id, front);
+          match self.inner.borrow_mut().remove_http_front(front) {
+            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err), data: None }
+          }
+      },
+      command => {
+        debug!("{} unsupported message for HTTP listener, ignoring: {:?}", message.id, command);
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
+      }
+    }
+  }
+
+  fn activate(&self, tcp_listener: Option<mio::net::TcpListener>) -> Option<Token> {
+    self.inner.borrow_mut().activate(tcp_listener)
+  }
+
+  fn deactivate(&self) -> Option<TcpListener> {
+    self.inner.borrow_mut().deactivate()
+  }
+
+  fn accept(&self) -> Result<TcpStream, AcceptError> {
+    self.inner.borrow().accept()
+  }
+
+  fn create_session(&self, socket: TcpStream, session_token: Token, timeout: Timeout)
+    -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError> {
+      let wrapper = self.clone();
+
+    self.inner.borrow().create_session(socket, session_token, timeout, wrapper)
+  }
+
+  fn give_back_listener(&self) -> Option<(SocketAddr, TcpListener)> {
+    if let Some(l) = self.inner.borrow_mut().listener.take() {
+      Some((self.inner.borrow().address, l))
+    } else {
+      None
+    }
+  }
+
+  fn listener_type(&self) -> ListenerType {
+    ListenerType::HTTP
   }
 }
 
@@ -1131,62 +1195,6 @@ impl ProxyConfiguration for Proxy {
         debug!("{} remove application {:?}", message.id, application);
         self.remove_application(&application);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
-      },
-      ProxyRequestData::AddHttpFront(front) => {
-        debug!("{} add front {:?}", message.id, front);
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
-          match listener.add_http_front(front) {
-            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
-            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err), data: None }
-          }
-        } else {
-          panic!("no HTTP listener found for front: {:?}", front);
-
-          //let (listener, tokens) = Listener::new(HttpListener::default(), event_loop,
-          //  self.pool.clone(), None, token: Token) -> (Listener,HashSet<Token>
-        }
-      },
-      ProxyRequestData::RemoveHttpFront(front) => {
-        debug!("{} front {:?}", message.id, front);
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
-          match (*listener).remove_http_front(front) {
-            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
-            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err), data: None }
-          }
-        } else {
-          panic!("trying to remove front from non existing listener");
-        }
-      },
-      ProxyRequestData::RemoveListener(remove) => {
-        info!("removing http listener at address {:?}", remove.front);
-        match self.remove_listener(remove) {
-          true => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
-          false => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("failed to remove listener")), data: None }
-        }
-      },
-      ProxyRequestData::SoftStop => {
-        info!("{} processing soft shutdown", message.id);
-        let mut v = self.listeners.drain().collect::<HashMap<_,_>>();
-        for (_, l) in v.iter_mut() {
-          l.listener.take().map(|sock| {
-            if let Err(e) = self.poll.borrow_mut().deregister(&sock) {
-              error!("error deregistering listen socket({:?}): {:?}", sock, e);
-            }
-          });
-        }
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None }
-      },
-      ProxyRequestData::HardStop => {
-        info!("{} hard shutdown", message.id);
-        let mut v = self.listeners.drain().collect::<HashMap<_,_>>();
-        for (_, mut l) in v.drain() {
-          l.listener.take().map(|sock| {
-            if let Err(e) = self.poll.borrow_mut().deregister(&sock) {
-              error!("error deregistering listen socket({:?}): {:?}", sock, e);
-            }
-          });
-        }
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None }
       },
       ProxyRequestData::Status => {
         debug!("{} status", message.id);
@@ -1206,52 +1214,11 @@ impl ProxyConfiguration for Proxy {
       }
     }
   }
-
-  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
-    self.listeners.get_mut(&Token(token.0)).unwrap().accept()
-  }
-
-  fn create_session(&mut self, frontend_sock: TcpStream, listen_token: ListenToken, session_token: Token, timeout: Timeout,
-    proxy: Weak<RefCell<Self>>)
-  -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError> {
-    if let Some(ref listener) = self.listeners.get(&Token(listen_token.0)) {
-      if let Err(e) = frontend_sock.set_nodelay(true) {
-        error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
-      }
-      if let Some(c) = Session::new(frontend_sock, session_token, proxy, Rc::downgrade(&self.pool),
-      listener.config.public_address, listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout,
-      listener.answers.clone(), listener.token) {
-        if let Err(e) = self.poll.borrow_mut().register(
-          c.front_socket(),
-          session_token,
-          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-          PollOpt::edge()
-          ) {
-            error!("error deregistering listen socket({:?}): {:?}", c.front_socket(), e);
-          }
-
-        Ok((Rc::new(RefCell::new(c)) as Rc<RefCell<dyn ProxySession>>, false))
-      } else {
-        Err(AcceptError::TooManySessions)
-      }
-    } else {
-      //FIXME
-      Err(AcceptError::IoError)
-    }
-
-  }
-
-  fn listen_port_state(&self, port: &u16) -> ListenPortState {
-    //FIXME TOKEN
-    fixme!();
-    ListenPortState::Available
-    //let token = Token(0);
-    //if port == &self.listeners[&token].address.port() { ListenPortState::InUse } else { ListenPortState::Available }
-  }
 }
 
-pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
+pub fn start(channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   use super::server;
+
   let poll = Rc::new(RefCell::new(Poll::new().expect("could not create event loop")));
 
   let pool = Rc::new(RefCell::new(
@@ -1275,16 +1242,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
 
-  let token = {
-    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-    let e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
-    Token(e.index().0)
-  };
-
-  let front = config.front;
-  let mut proxy = Proxy::new(pool.clone(), backends.clone(), poll.clone());
-  let _ = proxy.add_listener(config, token);
-  let _ = proxy.activate_listener(&mut poll.borrow_mut(), &front, None);
+  let proxy = Rc::new(RefCell::new(Proxy::new(pool.clone(), backends.clone(), poll.clone())));
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
   let scm = ScmSocket::new(scm_client.into_raw_fd());
   if let Err(e) = scm.send_listeners(Listeners {
@@ -1297,7 +1255,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
 
   let mut server_config: server::ServerConfig = Default::default();
   server_config.max_connections = max_buffers;
-  let mut server    = Server::new(poll, channel, ScmSocket::new(scm_server.into_raw_fd()),
+  let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.into_raw_fd()),
     sessions, pool, backends, Some(proxy), None, None, server_config, None);
 
   println!("starting event loop");
@@ -1318,7 +1276,8 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use sozu_command::proxy::{self, ProxyRequestData,HttpFront,HttpListener,ProxyRequest,LoadBalancingParams,PathRule,RulePosition};
+  use sozu_command::proxy::{self, ProxyRequestData,HttpFront,HttpListener,ProxyRequest,LoadBalancingParams,PathRule,RulePosition,
+    ActivateListener, ListenerType};
   use sozu_command::config::LoadBalancingAlgorithms;
   use sozu_command::channel::Channel;
 
@@ -1351,8 +1310,17 @@ mod tests {
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
     let _jg = thread::spawn(move || {
       setup_test_logger!();
-      start(config, channel, 10, 16384);
+      start(channel, 10, 16384);
     });
+
+    let activate = ActivateListener {
+      front: config.front,
+      proxy: ListenerType::HTTP,
+      from_scm: false,
+    };
+
+    command.write_message(&ProxyRequest { id: String::from("Listener"), order: ProxyRequestData::AddHttpListener(config) });
+    command.write_message(&ProxyRequest { id: String::from("Activate"), order: ProxyRequestData::ActivateListener(activate)});
 
     let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });
@@ -1407,8 +1375,17 @@ mod tests {
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
     let _jg = thread::spawn(move|| {
-      start(config, channel, 10, 16384);
+      start(channel, 10, 16384);
     });
+
+    let activate = ActivateListener {
+      front: config.front,
+      proxy: ListenerType::HTTP,
+      from_scm: false,
+    };
+
+    command.write_message(&ProxyRequest { id: String::from("Listener"), order: ProxyRequestData::AddHttpListener(config) });
+    command.write_message(&ProxyRequest { id: String::from("Activate"), order: ProxyRequestData::ActivateListener(activate)});
 
     let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });
@@ -1484,8 +1461,17 @@ mod tests {
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
     let _jg = thread::spawn(move || {
       setup_test_logger!();
-      start(config, channel, 10, 16384);
+      start(channel, 10, 16384);
     });
+
+    let activate = ActivateListener {
+      front: config.front,
+      proxy: ListenerType::HTTP,
+      from_scm: false,
+    };
+
+    command.write_message(&ProxyRequest { id: String::from("Listener"), order: ProxyRequestData::AddHttpListener(config) });
+    command.write_message(&ProxyRequest{ id: String::from("Activate"), order: ProxyRequestData::ActivateListener(activate)});
 
     let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default(), answer_503: None };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddApplication(application) });
@@ -1575,6 +1561,13 @@ mod tests {
     fronts.add_http_front(HttpFront { app_id: "app_1".to_owned(), address: "0.0.0.0:80".parse().unwrap(), hostname: "other.domain".to_owned(), path: PathRule::Prefix("/test".to_owned()), position: RulePosition::Tree });
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
+    let poll = Rc::new(RefCell::new(Poll::new().expect("could not create event loop")));
+
+    let pool = Rc::new(RefCell::new(
+      Pool::with_capacity(2, 0, || Buffer::with_capacity(100))
+    ));
+    let backends = Rc::new(RefCell::new(BackendMap::new()));
+    let proxy = Rc::new(RefCell::new(Proxy::new(pool.clone(), backends.clone(), poll.clone())));
     let listener = Listener {
       listener: None,
       address:  front,
@@ -1583,6 +1576,8 @@ mod tests {
       config: Default::default(),
       token: Token(0),
       active: true,
+      proxy,
+      poll,
     };
 
     let frontend1 = listener.frontend_from_request("lolcatho.st", "/");

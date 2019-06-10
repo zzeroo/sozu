@@ -30,8 +30,18 @@ fn main() {
   let jg = thread::spawn(move || {
     let max_buffers = 500;
     let buffer_size = 16384;
-    sozu::http::start(config, channel, max_buffers, buffer_size);
+    sozu::http::start(channel, max_buffers, buffer_size);
   });
+
+  let activate = proxy::ActivateListener {
+    front: config.front,
+    proxy: proxy::ListenerType::HTTP,
+    from_scm: false,
+  };
+
+  command.write_message(&proxy::ProxyRequest { id: String::from("Listener"), order: proxy::ProxyRequestData::AddHttpListener(config) });
+  command.write_message(&proxy::ProxyRequest{ id: String::from("Activate"), order: proxy::ProxyRequestData::ActivateListener(activate)});
+
 
   let http_front = proxy::HttpFront {
     app_id:   String::from("test"),

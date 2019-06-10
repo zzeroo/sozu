@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::io::ErrorKind;
 use slab::Slab;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::cell::RefCell;
 use std::net::{SocketAddr,Shutdown};
 use uuid::Uuid;
@@ -16,7 +16,8 @@ use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
-use sozu_command::proxy::{ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent,RemoveListener};
+use sozu_command::proxy::{ProxyRequestData,ProxyRequest,ProxyResponse,
+  ProxyResponseStatus,ProxyEvent,ListenerType};
 use sozu_command::proxy::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
@@ -25,7 +26,7 @@ use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetri
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use backends::BackendMap;
-use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
+use server::{Server,ProxyChannel,SessionToken,
   ListenSession, CONN_RETRIES, push_event};
 use pool::{Pool,Checkout};
 use socket::{server_bind,server_unbind};
@@ -65,12 +66,12 @@ pub struct Session {
   timeout:            Timeout,
   last_event:         SteadyTime,
   connection_attempt: u8,
-  proxy:              Weak<RefCell<Proxy>>,
+  listener:           ListenerWrapper,
 }
 
 impl Session {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<Buffer>,
-    back_buf: Checkout<Buffer>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout, proxy: Weak<RefCell<Proxy>>) -> Session {
+    back_buf: Checkout<Buffer>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout, listener: ListenerWrapper) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.local_addr().ok();
     let mut frontend_buffer = None;
@@ -117,7 +118,7 @@ impl Session {
       timeout,
       last_event:         SteadyTime::now(),
       connection_attempt: 0,
-      proxy,
+      listener,
     }
   }
 
@@ -683,15 +684,15 @@ impl ProxySession for Session {
 
   fn connect_backend(&mut self, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let res = {
-      let p: Rc<RefCell<Proxy>> = self.proxy.upgrade().unwrap();
-      let mut proxy = p.borrow_mut();
+      let l = self.listener.inner.clone();
+      let listener = l.borrow_mut();
 
-      if proxy.listeners[&self.accept_token].app_id.is_none() {
+      if listener.app_id.is_none() {
         error!("no TCP application corresponds to that front address");
         return Err(ConnectionError::HostNotFound);
       }
 
-      let app_id = proxy.listeners[&self.accept_token].app_id.clone();
+      let app_id = listener.app_id.clone();
       self.app_id = app_id.clone();
       let app_id = app_id.unwrap();
 
@@ -701,7 +702,7 @@ impl ProxySession for Session {
         return Err(ConnectionError::NoBackendAvailable)
       }
 
-      let conn = proxy.backend_from_app_id(self, &app_id);
+      let conn = listener.proxy.borrow_mut().backend_from_app_id(self, &app_id);
       match conn {
         Ok(stream) => {
           if let Err(e) = stream.set_nodelay(true) {
@@ -709,7 +710,7 @@ impl ProxySession for Session {
           }
           self.back_connected = BackendConnectionStatus::Connecting;
 
-          if let Err(e) = proxy.poll.borrow_mut().register(
+          if let Err(e) = listener.poll.borrow_mut().register(
             &stream,
             back_token,
             Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
@@ -733,17 +734,19 @@ impl ProxySession for Session {
 }
 
 pub struct Listener {
-  app_id:   Option<String>,
-  listener: Option<TcpListener>,
-  token:    Token,
-  address:  SocketAddr,
-  pool:     Rc<RefCell<Pool<Buffer>>>,
-  config:   TcpListenerConfig,
-  active:   bool,
+  app_id:    Option<String>,
+  listener:  Option<TcpListener>,
+  token:     Token,
+  address:   SocketAddr,
+  pool:      Rc<RefCell<Pool<Buffer>>>,
+  config:    TcpListenerConfig,
+  active:    bool,
+  pub proxy: Rc<RefCell<Proxy>>,
+  poll:      Rc<RefCell<Poll>>,
 }
 
 impl Listener {
-  fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool<Buffer>>>, token: Token) -> Listener {
+  fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool<Buffer>>>, token: Token, proxy: Rc<RefCell<Proxy>>, poll: Rc<RefCell<Poll>>) -> Listener {
     Listener {
       app_id: None,
       listener: None,
@@ -752,10 +755,12 @@ impl Listener {
       pool,
       config,
       active: false,
+      proxy,
+      poll,
     }
   }
 
-  pub fn activate(&mut self, event_loop: &mut Poll, tcp_listener: Option<TcpListener>) -> Option<Token> {
+  pub fn activate(&mut self, tcp_listener: Option<TcpListener>) -> Option<Token> {
     if self.active {
       return None;
     }
@@ -766,7 +771,7 @@ impl Listener {
 
 
     if let Some(ref sock) = listener {
-      if let Err(e ) = event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge()) {
+      if let Err(e ) = self.poll.borrow_mut().register(sock, self.token, Ready::readable(), PollOpt::edge()) {
         error!("error registering socket({:?}): {:?}", sock, e);
       }
     } else {
@@ -778,13 +783,13 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn deactivate(&mut self, event_loop: &mut Poll) -> Option<TcpListener> {
+  pub fn deactivate(&mut self) -> Option<TcpListener> {
     if !self.active {
       return None;
     }
 
     if let Some(listener) = self.listener.take() {
-      if let Err(e) = event_loop.deregister(&listener) {
+      if let Err(e) = self.poll.borrow_mut().deregister(&listener) {
         error!("error deregistering socket({:?}: {:?})", listener, e);
         self.listener = Some(listener);
         return None;
@@ -798,6 +803,151 @@ impl Listener {
     }
     return None;
   }
+
+  pub fn add_tcp_front(&mut self, app_id: &str, _front: &SocketAddr) -> bool {
+    self.app_id = Some(app_id.to_string());
+    true
+  }
+
+  pub fn remove_tcp_front(&mut self, _front: SocketAddr) -> bool {
+    self.app_id = None;
+    true
+  }
+
+  fn accept(&self) -> Result<TcpStream, AcceptError> {
+    if let Some(ref tcp_listener) = self.listener.as_ref() {
+      tcp_listener.accept().map(|(frontend_sock, _)| frontend_sock).map_err(|e| {
+        match e.kind() {
+          ErrorKind::WouldBlock => AcceptError::WouldBlock,
+          _ => {
+            error!("accept() IO error: {:?}", e);
+            AcceptError::IoError
+          }
+        }
+      })
+    } else {
+      Err(AcceptError::IoError)
+    }
+  }
+
+  fn create_session(&self, frontend_sock: TcpStream, session_token: Token, timeout: Timeout,
+    wrapper: ListenerWrapper)
+    -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError> {
+    let internal_token = Token(self.token.0);
+    let mut p = self.pool.borrow_mut();
+
+    if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
+      if self.app_id.is_none() {
+        error!("listener at address {:?} has no linked application", self.address);
+        return Err(AcceptError::IoError);
+      }
+
+      let proxy_protocol = self.proxy.borrow().configs
+                              .get(self.app_id.as_ref().unwrap())
+                              .and_then(|c| c.proxy_protocol.clone());
+
+      if let Err(e) = frontend_sock.set_nodelay(true) {
+        error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
+      }
+      let c = Session::new(frontend_sock, session_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
+      timeout, wrapper);
+      incr!("tcp.requests");
+
+      if let Err(e) = self.poll.borrow_mut().register(
+        c.front_socket(),
+        session_token,
+        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+        PollOpt::edge()
+        ) {
+        error!("error registering front socket({:?}): {:?}", c.front_socket(), e);
+      }
+
+      let should_connect_backend = proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
+      Ok((Rc::new(RefCell::new(c)) as Rc<RefCell<dyn ProxySession>>, should_connect_backend))
+    } else {
+      error!("could not get buffers from pool");
+      Err(AcceptError::TooManySessions)
+    }
+  }
+}
+
+#[derive(Clone)]
+pub struct ListenerWrapper {
+  pub inner: Rc<RefCell<Listener>>,
+}
+
+impl ListenerWrapper {
+  fn new(l: Listener) -> Self {
+    ListenerWrapper {
+      inner: Rc::new(RefCell::new(l)),
+    }
+  }
+}
+
+impl super::Listener for ListenerWrapper {
+  fn address(&self) -> SocketAddr {
+    self.inner.borrow().address
+  }
+
+  fn active(&self) -> bool {
+    self.inner.borrow().active
+  }
+
+  fn notify(&self, message: ProxyRequest) -> ProxyResponse {
+    // ToDo temporary
+    //trace!("{} notified", message);
+    match message.order {
+      ProxyRequestData::AddTcpFront(front) => {
+        debug!("{} add front {:?}", message.id, front);
+        match self.inner.borrow_mut().add_tcp_front(&front.app_id, &front.address) {
+          true => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+          false => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(format!("could not add TCP front: {:?}", front)), data: None }
+        }
+      },
+      ProxyRequestData::RemoveTcpFront(front) => {
+        debug!("{} front {:?}", message.id, front);
+          match self.inner.borrow_mut().remove_tcp_front(front.address) {
+            true => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+            false => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(format!("could not remove TCP front: {:?}", front)), data: None }
+          }
+      },
+      command => {
+        debug!("{} unsupported message for TCP listener, ignoring: {:?}", message.id, command);
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
+      }
+    }
+  }
+
+  fn activate(&self, tcp_listener: Option<mio::net::TcpListener>) -> Option<Token> {
+    self.inner.borrow_mut().activate(tcp_listener)
+  }
+
+  fn deactivate(&self) -> Option<TcpListener> {
+    self.inner.borrow_mut().deactivate()
+  }
+
+  fn accept(&self) -> Result<TcpStream, AcceptError> {
+    self.inner.borrow().accept()
+  }
+
+  fn create_session(&self, socket: TcpStream, session_token: Token, timeout: Timeout)
+    -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError> {
+      let wrapper = self.clone();
+
+    self.inner.borrow().create_session(socket, session_token, timeout, wrapper)
+  }
+
+  fn give_back_listener(&self) -> Option<(SocketAddr, TcpListener)> {
+    if let Some(l) = self.inner.borrow_mut().listener.take() {
+      Some((self.inner.borrow().address, l))
+    } else {
+      None
+    }
+  }
+
+  fn listener_type(&self) -> ListenerType {
+    ListenerType::TCP
+  }
 }
 
 #[derive(Debug)]
@@ -809,7 +959,6 @@ pub struct ApplicationConfiguration {
 pub struct Proxy {
   fronts:    HashMap<String, Token>,
   backends:  Rc<RefCell<BackendMap>>,
-  listeners: HashMap<Token, Listener>,
   configs:   HashMap<AppId, ApplicationConfiguration>,
   poll:      Rc<RefCell<Poll>>,
 }
@@ -820,88 +969,14 @@ impl Proxy {
     Proxy {
       backends,
       poll,
-      listeners: HashMap::new(),
       configs:   HashMap::new(),
       fronts:    HashMap::new(),
     }
   }
 
-  pub fn add_listener(&mut self, config: TcpListenerConfig, pool: Rc<RefCell<Pool<Buffer>>>, token: Token) -> Option<Token> {
-    if self.listeners.contains_key(&token) {
-      None
-    } else {
-      let listener = Listener::new(config, pool, token);
-      self.listeners.insert(listener.token, listener);
-      Some(token)
-    }
-  }
-
-  pub fn remove_listener(&mut self, remove: RemoveListener) -> bool {
-    let token = self.listeners.iter()
-      .find(|(_, listener)| listener.address == remove.front)
-      .and_then(|(token, listener)| {
-        match listener.active {
-          false => Some(token.clone()),
-          true => {
-            error!("Listener {:?} is still active, not removing", listener.address);
-            None
-          }
-        }
-      });
-
-    if let Some(t) = token {
-      self.listeners.remove_entry(&t);
-      return true;
-    } else {
-      return false;
-    }
-  }
-
-  pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
-    for listener in self.listeners.values_mut() {
-      if &listener.address == addr {
-        return listener.activate(event_loop, tcp_listener);
-      }
-    }
-    None
-  }
-
-  pub fn deactivate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr) -> Option<TcpListener> {
-    for listener in self.listeners.values_mut() {
-      if &listener.address == addr {
-        return listener.deactivate(event_loop);
-      }
-    }
-    None
-  }
-
-  pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
-    self.listeners.values_mut()
-      .filter(|app_listener| app_listener.listener.is_some())
-      .map(|app_listener| (app_listener.address, app_listener.listener.take().unwrap()))
-      .collect()
-  }
-
-  pub fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr) -> bool {
-    if let Some(listener) = self.listeners.values_mut().find(|l| l.address == *front) {
-      self.fronts.insert(app_id.to_string(), listener.token);
-      info!("add_tcp_front: fronts are now: {:?}", self.fronts);
-      listener.app_id = Some(app_id.to_string());
-      true
-    } else {
-      false
-    }
-  }
-
-  pub fn remove_tcp_front(&mut self, front: SocketAddr) -> bool {
-    if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front) {
-      if let Some(app_id) = listener.app_id.take() {
-        self.fronts.remove(&app_id);
-      }
-      true
-    } else {
-      false
-    }
+  pub fn add_listener(&mut self, config: TcpListenerConfig, pool: Rc<RefCell<Pool<Buffer>>>, token: Token, proxy: Rc<RefCell<Proxy>>) -> Option<ListenerWrapper> {
+    let listener = ListenerWrapper::new(Listener::new(config, pool, token, proxy, self.poll.clone()));
+    Some(listener)
   }
 
   fn backend_from_app_id(&mut self, session: &mut Session, app_id: &str) -> Result<TcpStream,ConnectionError> {
@@ -919,30 +994,6 @@ impl Proxy {
 impl ProxyConfiguration for Proxy {
   fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
     match message.order {
-      ProxyRequestData::AddTcpFront(front) => {
-        let _ = self.add_tcp_front(&front.app_id, &front.address);
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
-      },
-      ProxyRequestData::RemoveTcpFront(front) => {
-        let _ = self.remove_tcp_front(front.address);
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
-      },
-      ProxyRequestData::SoftStop => {
-        info!("{} processing soft shutdown", message.id);
-        let mut v = self.listeners.drain().collect::<HashMap<_,_>>();
-        for (_, l) in v.iter_mut() {
-          l.listener.take().map(|sock| self.poll.borrow_mut().deregister(&sock));
-        }
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None}
-      },
-      ProxyRequestData::HardStop => {
-        info!("{} hard shutdown", message.id);
-        let mut v = self.listeners.drain().collect::<HashMap<_,_>>();
-        for (_, mut l) in v.drain() {
-          l.listener.take().map(|sock| self.poll.borrow_mut().deregister(&sock));
-        }
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
-      },
       ProxyRequestData::Status => {
         info!("{} status", message.id);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
@@ -967,94 +1018,16 @@ impl ProxyConfiguration for Proxy {
       ProxyRequestData::RemoveApplication(_) => {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      ProxyRequestData::RemoveListener(remove) => {
-        match self.remove_listener(remove) {
-          true => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
-          false => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("failed to remove listener")), data: None }
-        }
-      },
       command => {
         error!("{} unsupported message for TCP proxy, ignoring {:?}", message.id, command);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None}
       }
     }
   }
-
-  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
-    let internal_token = Token(token.0);
-    if let Some(listener) = self.listeners.get_mut(&internal_token) {
-      if let Some(ref tcp_listener) = listener.listener.as_ref() {
-        tcp_listener.accept().map(|(frontend_sock, _)| frontend_sock).map_err(|e| {
-          match e.kind() {
-            ErrorKind::WouldBlock => AcceptError::WouldBlock,
-            _ => {
-              error!("accept() IO error: {:?}", e);
-              AcceptError::IoError
-            }
-          }
-        })
-      } else {
-        Err(AcceptError::IoError)
-      }
-    } else {
-      Err(AcceptError::IoError)
-    }
-  }
-
-  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout,
-    proxy: Weak<RefCell<Self>>)
-    -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError> {
-    let internal_token = Token(token.0);
-    if let Some(listener) = self.listeners.get_mut(&internal_token) {
-      let mut p = (*listener.pool).borrow_mut();
-
-      if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-        if listener.app_id.is_none() {
-          error!("listener at address {:?} has no linked application", listener.address);
-          return Err(AcceptError::IoError);
-        }
-
-        let proxy_protocol = self.configs
-                                .get(listener.app_id.as_ref().unwrap())
-                                .and_then(|c| c.proxy_protocol.clone());
-
-        if let Err(e) = frontend_sock.set_nodelay(true) {
-          error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
-        }
-        let c = Session::new(frontend_sock, session_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
-        timeout, proxy);
-        incr!("tcp.requests");
-
-        if let Err(e) = self.poll.borrow_mut().register(
-          c.front_socket(),
-          session_token,
-          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-          PollOpt::edge()
-          ) {
-          error!("error registering front socket({:?}): {:?}", c.front_socket(), e);
-        }
-
-        let should_connect_backend = proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
-        Ok((Rc::new(RefCell::new(c)) as Rc<RefCell<dyn ProxySession>>, should_connect_backend))
-      } else {
-        error!("could not get buffers from pool");
-        Err(AcceptError::TooManySessions)
-      }
-    } else {
-      Err(AcceptError::IoError)
-    }
-  }
-
-  fn listen_port_state(&self, port: &u16) -> ListenPortState {
-    match self.listeners.values().find(|listener| &listener.address.port() == port) {
-      Some(_) => ListenPortState::InUse,
-      None => ListenPortState::Available
-    }
-  }
 }
 
 
-pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
+pub fn start(max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
   use server;
 
   let poll = Rc::new(RefCell::new(Poll::new().expect("could not create event loop")));
@@ -1080,16 +1053,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
     entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
 
-  let token = {
-    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-    let e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
-    Token(e.index().0)
-  };
-
-  let front = config.front;
-  let mut configuration = Proxy::new(backends.clone(), poll.clone());
-  let _ = configuration.add_listener(config, pool.clone(), token);
-  let _ = configuration.activate_listener(&mut poll.borrow_mut(), &front, None);
+  let configuration = Proxy::new(backends.clone(), poll.clone());
   let (scm_server, _scm_client) = UnixStream::pair().unwrap();
 
   let mut server_config: server::ServerConfig = Default::default();
@@ -1112,7 +1076,7 @@ mod tests {
   use std::sync::{Arc, Barrier};
   use std::sync::atomic::{AtomicBool, Ordering};
   use sozu_command::scm_socket::Listeners;
-  use sozu_command::proxy::{self,TcpFront,LoadBalancingParams};
+  use sozu_command::proxy::{self,TcpFront,LoadBalancingParams,ActivateListener};
   use sozu_command::channel::Channel;
   use std::os::unix::io::IntoRawFd;
   static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
@@ -1245,20 +1209,6 @@ mod tests {
       }
 
       let mut configuration = Proxy::new(backends.clone(), poll.clone());
-      let listener_config = TcpListenerConfig {
-        front: "127.0.0.1:1234".parse().unwrap(),
-        public_address: None,
-        expect_proxy: false,
-      };
-
-      {
-        let front = listener_config.front.clone();
-        let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-        let _ = configuration.add_listener(listener_config, pool.clone(), Token(entry.index().0));
-        let _ = configuration.activate_listener(&mut poll.borrow_mut(), &front, None);
-        entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::TCPListen })));
-      }
-
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
       let scm = ScmSocket::new(scm_client.into_raw_fd());
       scm.send_listeners(Listeners {
@@ -1278,6 +1228,20 @@ mod tests {
 
     command.set_blocking(true);
     {
+     let config = TcpListenerConfig {
+        front: "127.0.0.1:1234".parse().unwrap(),
+        public_address: None,
+        expect_proxy: false,
+      };
+      let activate = ActivateListener {
+        front: config.front,
+        proxy: ListenerType::TCP,
+        from_scm: false,
+      };
+
+      command.write_message(&ProxyRequest { id: String::from("Listener"), order: ProxyRequestData::AddTcpListener(config) });
+      command.write_message(&ProxyRequest { id: String::from("Activate"), order: ProxyRequestData::ActivateListener(activate)});
+
       let front = TcpFront {
         app_id: String::from("yolo"),
         address: "127.0.0.1:1234".parse().unwrap(),

@@ -5,7 +5,7 @@ extern crate time;
 
 use std::thread;
 use std::io::stdout;
-use sozu_command::proxy::{self, TcpListener, LoadBalancingParams};
+use sozu_command::proxy::{self, TcpListener, LoadBalancingParams, ActivateListener, ListenerType};
 use sozu_command::channel::Channel;
 use sozu_command::logging::{Logger,LoggerBackend};
 
@@ -27,14 +27,24 @@ fn main() {
     let max_listeners = 500;
     let max_buffers   = 500;
     let buffer_size   = 16384;
-    let listener = TcpListener {
-      front: "127.0.0.1:8080".parse().unwrap(),
-      public_address: None,
-      expect_proxy: false,
-    };
+    
     Logger::init("TCP".to_string(), "debug", LoggerBackend::Stdout(stdout()), None);
-    sozu::tcp::start(listener, max_buffers, buffer_size, channel);
+    sozu::tcp::start(max_buffers, buffer_size, channel);
   });
+
+  let config = TcpListener {
+    front: "127.0.0.1:8080".parse().unwrap(),
+    public_address: None,
+    expect_proxy: false,
+  };
+  let activate = ActivateListener {
+    front: config.front,
+    proxy: ListenerType::TCP,
+    from_scm: false,
+  };
+
+  command.write_message(&proxy::ProxyRequest { id: String::from("Listener"), order: proxy::ProxyRequestData::AddTcpListener(config) });
+  command.write_message(&proxy::ProxyRequest { id: String::from("Activate"), order: proxy::ProxyRequestData::ActivateListener(activate)});
 
   let tcp_front = proxy::TcpFront {
     app_id:  String::from("test"),

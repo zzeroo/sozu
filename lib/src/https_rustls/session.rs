@@ -25,7 +25,7 @@ use retry::RetryPolicy;
 use util::UnwrapLog;
 use buffer_queue::BufferQueue;
 use server::push_event;
-use super::configuration::Proxy;
+use super::configuration::ListenerWrapper;
 use {BackendConnectAction, ConnectionError};
 
 pub enum State {
@@ -42,7 +42,7 @@ pub struct Session {
   protocol:           Option<State>,
   pub public_address: Option<SocketAddr>,
   pool:               Weak<RefCell<Pool<Buffer>>>,
-  proxy:              Weak<RefCell<Proxy>>,
+  listener:           ListenerWrapper,
   pub metrics:        SessionMetrics,
   pub app_id:         Option<String>,
   sticky_name:        String,
@@ -55,7 +55,7 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, proxy: Weak<RefCell<Proxy>>, pool: Weak<RefCell<Pool<Buffer>>>,
+  pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, listener: ListenerWrapper, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Session {
     let peer_address = if expect_proxy {
@@ -82,7 +82,7 @@ impl Session {
       protocol:       state,
       public_address,
       pool,
-      proxy,
+      listener,
       metrics:        SessionMetrics::new(),
       app_id:         None,
       sticky_name,
@@ -744,20 +744,20 @@ impl ProxySession for Session {
 
   fn connect_backend(&mut self, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let res = {
-      let p: Rc<RefCell<Proxy>> = self.proxy.upgrade().unwrap();
-      let mut proxy = p.borrow_mut();
+      let l = self.listener.inner.clone();
+      let mut listener = l.borrow_mut();
 
       let old_app_id = self.http().and_then(|ref http| http.app_id.clone());
       let old_back_token = self.back_token();
 
-      proxy.check_circuit_breaker(self)?;
+      listener.check_circuit_breaker(self)?;
 
-      let app_id = proxy.app_id_from_request(self)?;
+      let app_id = listener.app_id_from_request(self)?;
 
       if (self.http().and_then(|h| h.app_id.as_ref()) == Some(&app_id)) && self.back_connected == BackendConnectionStatus::Connected {
         let has_backend = self.backend.as_ref().map(|backend| {
             let ref backend = *backend.borrow();
-            proxy.backends.borrow().has_backend(&app_id, backend)
+            listener.proxy.borrow().backends.borrow().has_backend(&app_id, backend)
           }).unwrap_or(false);
 
         let is_valid_backend_socket = has_backend && self.http().map(|h| h.test_back_socket()).unwrap_or(false);
@@ -768,7 +768,7 @@ impl ProxySession for Session {
           self.metrics.backend_start();
           return Ok(BackendConnectAction::Reuse);
         } else if let Some(token) = self.back_token() {
-          self.close_backend(token, &mut proxy.poll.borrow_mut());
+          self.close_backend(token, &mut listener.poll.borrow_mut());
 
           //reset the back token here so we can remove it
           //from the slab after backend_from* fails
@@ -778,7 +778,7 @@ impl ProxySession for Session {
 
       if old_app_id.is_some() && old_app_id.as_ref() != Some(&app_id) {
         if let Some(token) = self.back_token() {
-          self.close_backend(token, &mut proxy.poll.borrow_mut());
+          self.close_backend(token, &mut listener.poll.borrow_mut());
 
           //reset the back token here so we can remove it
           //from the slab after backend_from* fails
@@ -791,8 +791,8 @@ impl ProxySession for Session {
       let sticky_session = self.http()
         .and_then(|http| http.request.as_ref())
         .and_then(|r| r.get_sticky_session());
-      let front_should_stick = proxy.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-      let socket = proxy.backend_from_request(self, &app_id, front_should_stick, sticky_session)?;
+      let front_should_stick = listener.proxy.borrow_mut().applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
+      let socket = listener.backend_from_request(self, &app_id, front_should_stick, sticky_session)?;
 
       self.http().map(|http| {
         http.app_id = Some(app_id.clone());
@@ -810,7 +810,7 @@ impl ProxySession for Session {
       self.back_connected = BackendConnectionStatus::Connecting;
       if let Some(back_token) = old_back_token {
         self.set_back_token(back_token);
-        if let Err(e) = proxy.poll.borrow_mut().register(
+        if let Err(e) = listener.poll.borrow_mut().register(
           &socket,
           back_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
@@ -822,7 +822,7 @@ impl ProxySession for Session {
         self.set_back_socket(socket);
         Ok(BackendConnectAction::Replace)
       } else {
-        if let Err(e) = proxy.poll.borrow_mut().register(
+        if let Err(e) = listener.poll.borrow_mut().register(
           &socket,
           back_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),

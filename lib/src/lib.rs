@@ -39,7 +39,7 @@
 //! thread::spawn(move || {
 //!   let max_buffers = 500;
 //!   let buffer_size = 16384;
-//!   sozu_lib::http::start(config, channel, max_buffers, buffer_size);
+//!   sozu_lib::http::start(channel, max_buffers, buffer_size);
 //! });
 //! ```
 //!
@@ -68,8 +68,17 @@
 //! # thread::spawn(move || {
 //! #   let max_buffers = 500;
 //! #   let buffer_size = 16384;
-//! #   sozu_lib::http::start(config, channel, max_buffers, buffer_size);
+//! #   sozu_lib::http::start(channel, max_buffers, buffer_size);
 //! # });
+//!
+//! let activate = proxy::ActivateListener {
+//!   front: config.front,
+//!   proxy: proxy::ListenerType::HTTP,
+//!   from_scm: false,
+//! };
+//!
+//! command.write_message(&proxy::ProxyRequest { id: String::from("Listener"), order: proxy::ProxyRequestData::AddHttpListener(config) });
+//! command.write_message(&proxy::ProxyRequest { id: String::from("Activate"), order: proxy::ProxyRequestData::ActivateListener(activate)});
 //!
 //! let http_front = proxy::HttpFront {
 //!   // address of the listener
@@ -142,8 +151,17 @@
 //!   let jg = thread::spawn(move || {
 //!     let max_buffers = 500;
 //!     let buffer_size = 16384;
-//!     sozu::http::start(config, channel, max_buffers, buffer_size);
+//!     sozu::http::start(channel, max_buffers, buffer_size);
 //!   });
+//!
+//!   let activate = proxy::ActivateListener {
+//!     front: config.front,
+//!     proxy: proxy::ListenerType::HTTP,
+//!     from_scm: false,
+//!   };
+//!
+//!   command.write_message(&proxy::ProxyRequest { id: String::from("Listener"), order: proxy::ProxyRequestData::AddHttpListener(config) });
+//!   command.write_message(&proxy::ProxyRequest { id: String::from("Activate"), order: proxy::ProxyRequestData::ActivateListener(activate)});
 //!
 //!   let http_front = proxy::HttpFront {
 //!     // address of the listener
@@ -238,16 +256,16 @@ pub mod https_rustls;
 
 use mio::{Poll,Ready,Token};
 use mio::unix::UnixReady;
-use mio::net::TcpStream;
+use mio::net::{TcpListener,TcpStream};
 use std::fmt;
 use std::str;
 use std::net::SocketAddr;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::cell::RefCell;
 use time::{SteadyTime,Duration};
 use mio_extras::timer::{Timer,Timeout};
 
-use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams};
+use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams,ListenerType};
 
 use self::retry::RetryPolicy;
 
@@ -306,13 +324,21 @@ pub enum AcceptError {
   WouldBlock,
 }
 
-use self::server::{ListenToken,ListenPortState};
 pub trait ProxyConfiguration {
   fn notify(&mut self, message: ProxyRequest) -> ProxyResponse;
-  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
-  fn create_session(&mut self, socket: TcpStream, token: ListenToken, session_token: Token, timeout: Timeout, proxy: Weak<RefCell<Self>>)
+}
+
+pub trait Listener {
+  fn address(&self) -> SocketAddr {unimplemented!()}
+  fn active(&self) -> bool {unimplemented!()}
+  fn notify(&self, message: ProxyRequest) -> ProxyResponse;
+  fn activate(&self, tcp_listener: Option<mio::net::TcpListener>) -> Option<Token>;
+  fn deactivate(&self) -> Option<TcpListener>;
+  fn give_back_listener(&self) -> Option<(SocketAddr, TcpListener)>;
+  fn listener_type(&self) -> ListenerType;
+  fn accept(&self) -> Result<TcpStream, AcceptError>;
+  fn create_session(&self, socket: TcpStream, session_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError>;
-  fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }
 
 #[derive(Debug,PartialEq,Eq)]

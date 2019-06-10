@@ -32,8 +32,17 @@ fn main() {
   let jg = thread::spawn(move || {
     let max_buffers = 500;
     let buffer_size = 16384;
-    sozu::http::start(config, channel, max_buffers, buffer_size);
+    sozu::http::start(channel, max_buffers, buffer_size);
   });
+
+  let activate = proxy::ActivateListener {
+    front: config.front,
+    proxy: proxy::ListenerType::HTTP,
+    from_scm: false,
+  };
+
+  command.write_message(&proxy::ProxyRequest { id: String::from("Listener"), order: proxy::ProxyRequestData::AddHttpListener(config) });
+  command.write_message(&proxy::ProxyRequest{ id: String::from("Activate"), order: proxy::ProxyRequestData::ActivateListener(activate)});
 
   let http_front = proxy::HttpFront {
     app_id:   String::from("app_1"),
@@ -66,7 +75,7 @@ fn main() {
   info!("MAIN\tHTTP -> {:?}", command.read_message());
 
 
-  let config = proxy::HttpsListener {
+  let config2 = proxy::HttpsListener {
     front: "127.0.0.1:8443".parse().expect("could not parse address"),
     cipher_list: String::from("ECDHE-ECDSA-CHACHA20-POLY1305:\
     ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:\
@@ -89,8 +98,17 @@ fn main() {
   let jg2 = thread::spawn(move || {
     let max_buffers = 500;
     let buffer_size = 16384;
-    sozu::https_rustls::configuration::start(config, channel2, max_buffers, buffer_size);
+    sozu::https_rustls::configuration::start(channel2, max_buffers, buffer_size);
   });
+
+   let activate2 = proxy::ActivateListener {
+    front: config2.front,
+    proxy: proxy::ListenerType::HTTPS,
+    from_scm: false,
+  };
+
+  command2.write_message(&proxy::ProxyRequest { id: String::from("Listener"), order: proxy::ProxyRequestData::AddHttpsListener(config2) });
+  command2.write_message(&proxy::ProxyRequest{ id: String::from("Activate"), order: proxy::ProxyRequestData::ActivateListener(activate2)});
 
   let cert1 = include_str!("../assets/certificate.pem");
   let key1  = include_str!("../assets/key.pem");
