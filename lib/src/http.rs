@@ -801,8 +801,8 @@ pub struct Listener {
 }
 
 pub struct Proxy {
-  backends:     Rc<RefCell<BackendMap>>,
   applications: HashMap<AppId, Application>,
+  backends:     Rc<RefCell<BackendMap>>,
   pool:         Rc<RefCell<Pool<Buffer>>>,
   poll:         Rc<RefCell<Poll>>,
 }

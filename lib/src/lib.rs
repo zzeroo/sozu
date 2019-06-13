@@ -262,6 +262,7 @@ use std::str;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use time::{SteadyTime,Duration};
 use mio_extras::timer::{Timer,Timeout};
 
@@ -339,6 +340,8 @@ pub trait Listener {
   fn accept(&self) -> Result<TcpStream, AcceptError>;
   fn create_session(&self, socket: TcpStream, session_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<dyn ProxySession>>, bool), AcceptError>;
+  fn query_all_certificates(&self) -> Option<BTreeMap<String, Vec<u8>>> { None }
+  fn query_certificates_domain(&self, _domain: &str) -> Option<(String, Vec<u8>)> { None }
 }
 
 #[derive(Debug,PartialEq,Eq)]

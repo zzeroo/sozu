@@ -670,6 +670,30 @@ impl ProxyRequestData {
       ProxyRequestData::ReturnListenSockets    => HashSet::new(),
     }
   }
+
+  pub fn listener(&self) -> Option<SocketAddr> {
+    match self {
+      ProxyRequestData::AddApplication(_) | ProxyRequestData::RemoveApplication(_) | ProxyRequestData::RemoveListener(_)
+      | ProxyRequestData::SoftStop | ProxyRequestData::HardStop | ProxyRequestData::Status | ProxyRequestData::Metrics
+      | ProxyRequestData::Logging(_) | ProxyRequestData::ReturnListenSockets | ProxyRequestData::Query(_) => None,
+      ProxyRequestData::AddHttpFront(ref front)      => Some(front.address),
+      ProxyRequestData::RemoveHttpFront(ref front)   => Some(front.address),
+      ProxyRequestData::AddHttpsFront(ref front)     => Some(front.address),
+      ProxyRequestData::RemoveHttpsFront(ref front)  => Some(front.address),
+      ProxyRequestData::AddTcpFront(ref front)       => Some(front.address),
+      ProxyRequestData::RemoveTcpFront(ref front)    => Some(front.address),
+      ProxyRequestData::AddCertificate(ref cert)     => Some(cert.front),
+      ProxyRequestData::ReplaceCertificate(ref cert) => Some(cert.front),
+      ProxyRequestData::RemoveCertificate(ref cert)  => Some(cert.front),
+      ProxyRequestData::AddBackend(_)                => None,
+      ProxyRequestData::RemoveBackend(_)             => None,
+      ProxyRequestData::AddHttpListener(_)           => None,
+      ProxyRequestData::AddHttpsListener(_)          => None,
+      ProxyRequestData::AddTcpListener(_)            => None,
+      ProxyRequestData::ActivateListener(_)          => None,
+      ProxyRequestData::DeactivateListener(_)        => None,
+    }
+  }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]

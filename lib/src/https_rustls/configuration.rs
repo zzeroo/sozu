@@ -7,7 +7,7 @@ use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use std::os::unix::io::{AsRawFd};
 use std::io::ErrorKind;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use slab::Slab;
 use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
@@ -19,7 +19,7 @@ use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
-  TlsVersion,Query,QueryCertificateType,ListenerType};
+  TlsVersion,ListenerType};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -422,34 +422,6 @@ impl super::super::Listener for ListenerWrapper {
         self.inner.borrow_mut().replace_certificate(replace_certificate);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
-        /*let res = self.listeners.values().map(|listener| {
-          let mut domains = (&unwrap_msg!(listener.resolver.0.lock()).domains).to_hashmap();
-          let res = domains.drain().map(|(k, v)| {
-            (String::from_utf8(k).unwrap(), v.0)
-          }).collect();
-
-          (listener.address, res)
-        }).collect::<HashMap<_,_>>();
-
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,
-          data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::All(res)))) }
-        */
-        unimplemented!()
-      },
-      ProxyRequestData::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
-        /*let res = self.listeners.iter().map(|(addr, listener)| {
-          let domains  = &unwrap_msg!(listener.resolver.0.lock()).domains;
-          (listener.address, domains.domain_lookup(d.as_bytes()).map(|(k, v)| {
-            (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
-          }))
-        }).collect::<HashMap<_,_>>();
-
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,
-          data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::Domain(res)))) }
-        */
-        unimplemented!()
-      },
       command => {
         debug!("{} unsupported message for HTTP listener, ignoring: {:?}", message.id, command);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
@@ -487,12 +459,26 @@ impl super::super::Listener for ListenerWrapper {
   fn listener_type(&self) -> ListenerType {
     ListenerType::HTTPS
   }
+
+  fn query_all_certificates(&self) -> Option<BTreeMap<String, Vec<u8>>> {
+    let mut domains = (&unwrap_msg!(self.inner.borrow().resolver.0.lock()).domains).to_hashmap();
+    Some(domains.drain().map(|(k, v)| {
+      (String::from_utf8(k).unwrap(), v.0)
+    }).collect())
+  }
+
+  fn query_certificates_domain(&self, d: &str) -> Option<(String, Vec<u8>)> {
+    self.inner.borrow().resolver.0.lock().ok()
+      .and_then(|r| r.domains.domain_lookup(d.as_bytes()).map(|(k, v)| {
+      (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
+    }))
+  }
 }
 
 pub struct Proxy {
   pub applications: HashMap<AppId, Application>,
-  custom_answers:   HashMap<AppId, CustomAnswers>,
   pub backends:     Rc<RefCell<BackendMap>>,
+  custom_answers:   HashMap<AppId, CustomAnswers>,
   pool:             Rc<RefCell<Pool<Buffer>>>,
   pub poll:         Rc<RefCell<Poll>>,
 }

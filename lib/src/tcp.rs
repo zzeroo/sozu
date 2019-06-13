@@ -957,7 +957,6 @@ pub struct ApplicationConfiguration {
 }
 
 pub struct Proxy {
-  fronts:    HashMap<String, Token>,
   backends:  Rc<RefCell<BackendMap>>,
   configs:   HashMap<AppId, ApplicationConfiguration>,
   poll:      Rc<RefCell<Poll>>,
@@ -970,7 +969,6 @@ impl Proxy {
       backends,
       poll,
       configs:   HashMap::new(),
-      fronts:    HashMap::new(),
     }
   }
 

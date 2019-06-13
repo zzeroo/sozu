@@ -9,7 +9,7 @@ use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use uuid::Uuid;
 use std::io::ErrorKind;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, BTreeMap};
 use slab::Slab;
 use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
@@ -28,8 +28,7 @@ use mio_extras::timer::{Timer,Timeout};
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
-  ProxyResponseStatus,TlsVersion,ProxyEvent,Query,QueryCertificateType,
-  ListenerType};
+  ProxyResponseStatus,TlsVersion,ProxyEvent,ListenerType};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -1436,34 +1435,6 @@ impl super::Listener for ListenerWrapper {
         self.inner.borrow_mut().add_certificate(replace_certificate.new_certificate);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
-        /*let res = self.listeners.values().map(|listener| {
-          let mut domains = (&unwrap_msg!(listener.resolver.0.lock()).domains).to_hashmap();
-          let res = domains.drain().map(|(k, v)| {
-            (String::from_utf8(k).unwrap(), v.0)
-          }).collect();
-
-          (listener.address, res)
-        }).collect::<HashMap<_,_>>();
-
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,
-          data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::All(res)))) }
-        */
-        unimplemented!()
-      },
-      ProxyRequestData::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
-        /*let res = self.listeners.iter().map(|(addr, listener)| {
-          let domains  = &unwrap_msg!(listener.resolver.0.lock()).domains;
-          (listener.address, domains.domain_lookup(d.as_bytes()).map(|(k, v)| {
-            (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
-          }))
-        }).collect::<HashMap<_,_>>();
-
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,
-          data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::Domain(res)))) }
-        */
-        unimplemented!()
-      },
       command => {
         debug!("{} unsupported message for HTTP listener, ignoring: {:?}", message.id, command);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
@@ -1499,6 +1470,21 @@ impl super::Listener for ListenerWrapper {
 
   fn listener_type(&self) -> ListenerType {
     ListenerType::HTTPS
+  }
+
+fn query_all_certificates(&self) -> Option<BTreeMap<String, Vec<u8>>> {
+  let mut domains = unwrap_msg!(self.inner.borrow().domains.lock()).to_hashmap();
+  let res = domains.drain().map(|(k, v)| {
+    (String::from_utf8(k).unwrap(), v.0.clone())
+  }).collect();
+  Some(res)
+  }
+
+  fn query_certificates_domain(&self, d: &str) -> Option<(String, Vec<u8>)> {
+    self.inner.borrow().domains.lock().ok()
+      .and_then(|domains| domains.domain_lookup(d.as_bytes()).map(|(k, v)| {
+        (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
+    }))
   }
 }
 
@@ -1569,34 +1555,6 @@ impl ProxyConfiguration for Proxy {
         });
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      /*ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
-        let res = self.listeners.values().map(|listener| {
-          let mut domains = unwrap_msg!(listener.domains.lock()).to_hashmap();
-          let res = domains.drain().map(|(k, v)| {
-            (String::from_utf8(k).unwrap(), v.0.clone())
-          }).collect();
-
-          (listener.address, res)
-        }).collect::<HashMap<_,_>>();
-
-        info!("got Certificates::All query, answering with {:?}", res);
-
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,
-          data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::All(res)))) }
-      },
-      ProxyRequestData::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
-        let res = self.listeners.values().map(|listener| {
-          let domains  = unwrap_msg!(listener.domains.lock());
-          (listener.address, domains.domain_lookup(d.as_bytes()).map(|(k, v)| {
-            (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
-          }))
-        }).collect::<HashMap<_,_>>();
-
-        info!("got Certificates::Domain({}) query, answering with {:?}", d, res);
-
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,
-          data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::Domain(res)))) }
-      }*/
       command => {
         error!("{} unsupported message for OpenSSL proxy, ignoring {:?}", message.id, command);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }

@@ -549,10 +549,25 @@ impl Server {
         },
         &Query::Certificates(ref q) => {
           match q {
-            // forward the query to the TLS implementation
-            QueryCertificateType::Domain(_) => {},
-            // forward the query to the TLS implementation
-            QueryCertificateType::All => {},
+            QueryCertificateType::Domain(d) => {
+              let res = self.listeners.values().filter(|l| l.listener_type() == ListenerType::HTTPS)
+                .map(|l| (l.address(), l.query_certificates_domain(&d))).collect();
+              push_queue(ProxyResponse {
+                id:     message.id.clone(),
+                status: ProxyResponseStatus::Ok,
+                data:   Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::Domain(res))))
+              });
+              return
+            },
+            QueryCertificateType::All => {
+              let res = self.listeners.values().filter_map(|l| l.query_all_certificates().map(|res| (l.address(), res))).collect();
+              push_queue(ProxyResponse {
+                id:     message.id.clone(),
+                status: ProxyResponseStatus::Ok,
+                data:   Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::All(res))))
+              });
+              return
+            },
             QueryCertificateType::Fingerprint(f) => {
               push_queue(ProxyResponse {
                 id:     message.id.clone(),
@@ -573,6 +588,18 @@ impl Server {
 
   pub fn notify_proxys(&mut self, message: ProxyRequest) {
     self.config_state.handle_order(&message.order);
+
+    match message.order.listener() {
+      Some(address) => {
+         if let Some(listener) = self.listeners.values_mut().find(|l| l.address() == address) {
+          push_queue(listener.notify(message))
+        } else {
+          push_queue(ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(format!("no listener at address: {}", address)), data: None })
+        }
+        return;
+      },
+      None => {},
+    }
 
     match message {
       ProxyRequest { order: ProxyRequestData::AddApplication(ref application), .. } => {
@@ -783,81 +810,6 @@ impl Server {
 
         let answer = ProxyResponse { id: id.to_string(), status, data: None };
         push_queue(answer);
-        return;
-      },
-      ProxyRequest { ref id, order: ProxyRequestData::AddHttpFront(ref front) } => {
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address() == front.address) {
-          push_queue(listener.notify(ProxyRequest { id: id.to_string(), order: ProxyRequestData::AddHttpFront(front.clone()) }))
-        } else {
-          push_queue(ProxyResponse{ id: id.to_string(), status: ProxyResponseStatus::Error(format!("no listener at address: {}", front.address)), data: None })
-        }
-        return;
-      },
-      ProxyRequest { ref id, order: ProxyRequestData::RemoveHttpFront(ref front) } => {
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address() == front.address) {
-          push_queue(listener.notify(ProxyRequest { id: id.to_string(), order: ProxyRequestData::RemoveHttpFront(front.clone()) }))
-        } else {
-          push_queue(ProxyResponse{ id: id.to_string(), status: ProxyResponseStatus::Error(format!("no listener at address: {}", front.address)), data: None })
-        }
-        return;
-      },
-       ProxyRequest { ref id, order: ProxyRequestData::AddHttpsFront(ref front) } => {
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address() == front.address) {
-          push_queue(listener.notify(ProxyRequest { id: id.to_string(), order: ProxyRequestData::AddHttpsFront(front.clone()) }))
-        } else {
-        push_queue(ProxyResponse{ id: id.to_string(), status: ProxyResponseStatus::Error(format!("no listener at address: {}", front.address)), data: None })
-        }
-        return;
-      },
-      ProxyRequest { ref id, order: ProxyRequestData::RemoveHttpsFront(ref front) } => {
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address() == front.address) {
-          push_queue(listener.notify(ProxyRequest { id: id.to_string(), order: ProxyRequestData::RemoveHttpsFront(front.clone()) }))
-        } else {
-        push_queue(ProxyResponse{ id: id.to_string(), status: ProxyResponseStatus::Error(format!("no listener at address: {}", front.address)), data: None })
-        }
-        return;
-      },
-      ProxyRequest { ref id, order: ProxyRequestData::AddCertificate(ref add_certificate)} => {
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address() == add_certificate.front) {
-          push_queue(listener.notify(ProxyRequest { id: id.to_string(), order: ProxyRequestData::AddCertificate(add_certificate.clone()) }))
-        } else {
-          push_queue(ProxyResponse{ id: id.to_string(), status: ProxyResponseStatus::Error(format!("no listener at address: {}", add_certificate.front)), data: None })
-        }
-        return;
-      },
-      ProxyRequest { ref id, order: ProxyRequestData::RemoveCertificate(ref remove_certificate)} => {
-        //FIXME: should return an error if certificate still has fronts referencing it
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address() == remove_certificate.front) {
-          push_queue(listener.notify(ProxyRequest { id: id.to_string(), order: ProxyRequestData::RemoveCertificate(remove_certificate.clone()) }))
-        } else {
-          push_queue(ProxyResponse{ id: id.to_string(), status: ProxyResponseStatus::Error(format!("no listener at address: {}", remove_certificate.front)), data: None })
-        }
-        return;
-      },
-      ProxyRequest { ref id, order: ProxyRequestData::ReplaceCertificate(ref replace_certificate)} => {
-        //FIXME: should return an error if certificate still has fronts referencing it
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address() == replace_certificate.front) {
-          push_queue(listener.notify(ProxyRequest { id: id.to_string(), order: ProxyRequestData::ReplaceCertificate(replace_certificate.clone()) }))
-        } else {
-          push_queue(ProxyResponse{ id: id.to_string(), status: ProxyResponseStatus::Error(format!("no listener at address: {}", replace_certificate.front)), data: None })
-        }
-        return;
-      },
-      // FIXME: handle ProxyRequestData::Query(Query::Certificates())
-      ProxyRequest { ref id, order: ProxyRequestData::AddTcpFront(ref front) } => {
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address() == front.address) {
-          push_queue(listener.notify(ProxyRequest { id: id.to_string(), order: ProxyRequestData::AddTcpFront(front.clone()) }))
-        } else {
-          push_queue(ProxyResponse{ id: id.to_string(), status: ProxyResponseStatus::Error(format!("no listener at address: {}", front.address)), data: None })
-        }
-        return;
-      },
-      ProxyRequest { ref id, order: ProxyRequestData::RemoveTcpFront(ref front) } => {
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address() == front.address) {
-          push_queue(listener.notify(ProxyRequest { id: id.to_string(), order: ProxyRequestData::RemoveTcpFront(front.clone()) }))
-        } else {
-          push_queue(ProxyResponse{ id: id.to_string(), status: ProxyResponseStatus::Error(format!("no listener at address: {}", front.address)), data: None })
-        }
         return;
       },
       _ => {},
