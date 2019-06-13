@@ -1163,7 +1163,6 @@ impl Server {
     if self.can_accept && !self.accept_ready.is_empty() {
       loop {
         if let Some(token) = self.accept_ready.iter().next().map(|token| ListenToken(token.0)) {
-          let protocol = self.sessions[SessionToken(token.0)].borrow().protocol();
           self.accept(token);
           if !self.can_accept || self.accept_ready.is_empty() {
             break;

@@ -1615,7 +1615,7 @@ yD0TrUjkXyjV/zczIYiYSROg9OE5UgYqswIBAg==
 }
 
 use server::HttpsProvider;
-pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
+pub fn start(channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   use server;
 
   let poll = Rc::new(RefCell::new(Poll::new().expect("could not create event loop")));

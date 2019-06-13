@@ -1206,7 +1206,7 @@ mod tests {
         entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
       }
 
-      let mut configuration = Proxy::new(backends.clone(), poll.clone());
+      let configuration = Proxy::new(backends.clone(), poll.clone());
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
       let scm = ScmSocket::new(scm_client.into_raw_fd());
       scm.send_listeners(Listeners {
