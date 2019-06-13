@@ -147,14 +147,15 @@ impl ScmSocket {
     let msg = socket::recvmsg(self.fd, &iov[..], Some(&mut cmsg), flags)?;
 
     let mut fd_count = 0;
-    let received_fds = msg.cmsgs()
-      .flat_map(|cmsg|
-                match cmsg {
-                  socket::ControlMessage::ScmRights(s) => s,
-                  _ => &[]
-                }.iter()
-               );
-    for (fd, place) in received_fds.zip(fds.iter_mut()) {
+    let mut received_fds:Vec<i32> = vec![];
+
+    for cmsg in msg.cmsgs() {
+      if let socket::ControlMessageOwned::ScmRights(s) = cmsg {
+        received_fds.extend(s.iter());
+      }
+    }
+
+    for (fd, place) in received_fds.iter().zip(fds.iter_mut()) {
       fd_count += 1;
       *place = *fd;
     }
@@ -202,6 +203,6 @@ impl Listeners {
   }
 
   pub fn get(&mut self, addr: &SocketAddr) -> Option<RawFd> {
-    self.get_http(addr).and(self.get_https((addr))).and(self.get_tcp(addr))
+    self.get_http(addr).and(self.get_https(addr)).and(self.get_tcp(addr))
   }
 }
