@@ -449,8 +449,9 @@ impl super::super::Listener for ListenerWrapper {
   }
 
   fn give_back_listener(&self) -> Option<(SocketAddr, TcpListener)> {
-    if let Some(l) = self.inner.borrow_mut().listener.take() {
-      Some((self.inner.borrow().address, l))
+    let mut listener = self.inner.borrow_mut();
+    if let Some(l) = listener.listener.take() {
+      Some((listener.address, l))
     } else {
       None
     }
