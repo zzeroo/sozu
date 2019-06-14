@@ -203,6 +203,6 @@ impl Listeners {
   }
 
   pub fn get(&mut self, addr: &SocketAddr) -> Option<RawFd> {
-    self.get_http(addr).and(self.get_https(addr)).and(self.get_tcp(addr))
+    self.get_http(addr).or(self.get_https(addr)).or(self.get_tcp(addr))
   }
 }
