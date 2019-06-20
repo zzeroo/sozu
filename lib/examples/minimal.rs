@@ -44,7 +44,7 @@ fn main() {
 
 
   let http_front = proxy::HttpFront {
-    app_id:   String::from("test"),
+    app_id:   proxy::ApplicationRule::Id(String::from("test")),
     address:  "127.0.0.1:8080".parse().unwrap(),
     hostname: String::from("example.com"),
     path:     PathRule::Prefix(String::from("/")),

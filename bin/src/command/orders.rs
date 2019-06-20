@@ -18,7 +18,7 @@ use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer, QueryApplicationType,
-MetricsData, AggregatedMetricsData, ProxyResponseData, HttpFront, TcpFront};
+MetricsData, AggregatedMetricsData, ProxyResponseData, HttpFront, TcpFront, ApplicationRule};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::state::get_application_ids_by_domain;
 use sozu_command::logging;
@@ -571,7 +571,11 @@ impl CommandServer {
           QueryApplicationType::AppId(ref app_id) => vec!(self.state.application_state(app_id)),
           QueryApplicationType::Domain(ref domain) => {
             let app_ids = get_application_ids_by_domain(&self.state, domain.hostname.clone(), domain.path.clone());
-            app_ids.iter().map(|ref app_id| self.state.application_state(app_id)).collect()
+            app_ids.iter().filter_map(|ref app_rule| if let ApplicationRule::Id(app_id) = app_rule {
+              Some(self.state.application_state(app_id))
+            } else {
+              None
+            }).collect()
           }
         };
 
@@ -636,8 +640,13 @@ impl CommandServer {
             return;
           },
           ProxyRequestData::RemoveHttpFront(HttpFront{ ref app_id, ref address, .. })
-          | ProxyRequestData::RemoveHttpsFront(HttpFront{ ref app_id, ref address, .. })
-          | ProxyRequestData::RemoveTcpFront(TcpFront{ ref app_id, ref address }) => {
+          | ProxyRequestData::RemoveHttpsFront(HttpFront{ ref app_id, ref address, .. }) => {
+            let msg = format!("No such frontend at {} for the application {:?}", address, app_id);
+            error!("{}", msg);
+            self.answer_error(token, message_id, msg, None);
+            return;
+          },
+          ProxyRequestData::RemoveTcpFront(TcpFront{ ref app_id, ref address }) => {
             let msg = format!("No such frontend at {} for the application {}", address, app_id);
             error!("{}", msg);
             self.answer_error(token, message_id, msg, None);

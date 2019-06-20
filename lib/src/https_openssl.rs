@@ -28,7 +28,7 @@ use mio_extras::timer::{Timer,Timeout};
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
-  ProxyResponseStatus,TlsVersion,ProxyEvent,ListenerType};
+  ProxyResponseStatus,TlsVersion,ProxyEvent,ListenerType,ApplicationRule};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -1207,7 +1207,7 @@ impl Listener {
   }
 
   // ToDo factor out with http.rs
-  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<String> {
+  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<ApplicationRule> {
     let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("frontend_from_request: invalid remaining chars after hostname. Host: {}", host);
@@ -1327,7 +1327,12 @@ impl Listener {
     let rl:RRequestLine = session.http().and_then(|h| h.request.as_ref()).and_then(|r| r.get_request_line())
       .ok_or(ConnectionError::NoRequestLineGiven)?;
     match self.frontend_from_request(&host, &rl.uri) {
-      Some(app_id) => Ok(app_id),
+      Some(ApplicationRule::Id(app_id)) => Ok(app_id),
+      Some(ApplicationRule::Reject) => {
+        let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer404, None);
+        session.set_answer(DefaultAnswerStatus::Answer403, answer);
+        Err(ConnectionError::Forbidden)
+      }
       None => {
         let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer404, None);
         session.set_answer(DefaultAnswerStatus::Answer404, answer);
@@ -1686,9 +1691,9 @@ mod tests {
 
   #[test]
   fn frontend_from_request_test() {
-    let app_id1 = "app_1".to_owned();
-    let app_id2 = "app_2".to_owned();
-    let app_id3 = "app_3".to_owned();
+    let app_id1 = ApplicationRule::Id("app_1".to_owned());
+    let app_id2 = ApplicationRule::Id("app_2".to_owned());
+    let app_id3 = ApplicationRule::Id("app_3".to_owned());
     let uri1 = "/".to_owned();
     let uri2 = "/yolo".to_owned();
     let uri3 = "/yolo/swag".to_owned();
@@ -1735,16 +1740,16 @@ mod tests {
 
     println!("TEST {}", line!());
     let frontend1 = listener.frontend_from_request("lolcatho.st", "/");
-    assert_eq!(frontend1.expect("should find a frontend"), "app_1");
+    assert_eq!(frontend1.expect("should find a frontend"), ApplicationRule::Id("app_1".to_string()));
     println!("TEST {}", line!());
     let frontend2 = listener.frontend_from_request("lolcatho.st", "/test");
-    assert_eq!(frontend2.expect("should find a frontend"), "app_1");
+    assert_eq!(frontend2.expect("should find a frontend"), ApplicationRule::Id("app_1".to_string()));
     println!("TEST {}", line!());
     let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test");
-    assert_eq!(frontend3.expect("should find a frontend"), "app_2");
+    assert_eq!(frontend3.expect("should find a frontend"), ApplicationRule::Id("app_2".to_string()));
     println!("TEST {}", line!());
     let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag");
-    assert_eq!(frontend4.expect("should find a frontend"), "app_3");
+    assert_eq!(frontend4.expect("should find a frontend"), ApplicationRule::Id("app_3".to_string()));
     println!("TEST {}", line!());
     let frontend5 = listener.frontend_from_request("domain", "/");
     assert_eq!(frontend5, None);

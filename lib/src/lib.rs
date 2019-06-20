@@ -83,7 +83,7 @@
 //! let http_front = proxy::HttpFront {
 //!   // address of the listener
 //!   address:  "127.0.0.1:8080".parse().unwrap(),
-//!   app_id:   String::from("test"),
+//!   app_id:   proxy::ApplicationRule::Id(String::from("test")),
 //!   hostname: String::from("example.com"),
 //!   path:     proxy::PathRule::Prefix(String::from("/")),
 //!   position: proxy::RulePosition::Tree,
@@ -166,7 +166,7 @@
 //!   let http_front = proxy::HttpFront {
 //!     // address of the listener
 //!     address:  "127.0.0.1:8080".parse().unwrap(),
-//!     app_id:   String::from("test"),
+//!     app_id:   proxy::ApplicationRule::Id(String::from("test")),
 //!     hostname: String::from("example.com"),
 //!     path:     proxy::PathRule::Prefix(String::from("/")),
 //!     position: proxy::RulePosition::Tree,
@@ -438,9 +438,10 @@ pub enum ConnectionError {
   NoRequestLineGiven,
   InvalidHost,
   HostNotFound,
+  Forbidden,
   NoBackendAvailable,
   ToBeDefined,
-  HttpsRedirect
+  HttpsRedirect,
 }
 
 #[derive(Debug,PartialEq,Eq)]

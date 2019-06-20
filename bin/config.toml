@@ -218,7 +218,8 @@ protocol = "http"
 # - https_redirect = false #  activates automatic redirection to HTTPS for this application
 frontends = [
   { address = "0.0.0.0:8080", hostname = "lolcatho.st" },
-  { address = "0.0.0.0:8443", hostname = "lolcatho.st", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" }
+  { address = "0.0.0.0:8443", hostname = "lolcatho.st", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" },
+  { address = "0.0.0.0:8080", hostname = "lolcatho.st", path = "/admin", reject = true }
 ]
 
 # backends configuration

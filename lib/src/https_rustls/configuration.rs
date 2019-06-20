@@ -19,7 +19,7 @@ use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
-  TlsVersion,ListenerType};
+  TlsVersion,ListenerType,ApplicationRule};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -214,7 +214,7 @@ impl Listener {
   }
 
   // ToDo factor out with http.rs
-  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<String> {
+  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<ApplicationRule> {
     let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
@@ -317,7 +317,12 @@ impl Listener {
       .and_then(|h| h.request.as_ref()).and_then(|r| r.get_request_line())
       .ok_or(ConnectionError::NoRequestLineGiven)?;
     match self.frontend_from_request(&host, &rl.uri) {
-      Some(app_id) => Ok(app_id),
+      Some(ApplicationRule::Id(app_id)) => Ok(app_id),
+      Some(ApplicationRule::Reject) => {
+        let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer404, None);
+        session.set_answer(DefaultAnswerStatus::Answer403, answer);
+        Err(ConnectionError::Forbidden)
+      }
       None => {
         let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer404, None);
         session.set_answer(DefaultAnswerStatus::Answer404, answer);

@@ -16,7 +16,8 @@ use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,
-  ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent,ListenerType};
+  ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent,ListenerType,
+  ApplicationRule};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -927,7 +928,7 @@ impl Listener {
     }
   }
 
-  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<String> {
+  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<ApplicationRule> {
     let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("frontend_from_request: invalid remaining chars after hostname. Host: {}", host);
@@ -1017,7 +1018,12 @@ impl Listener {
       .and_then(|s| s.get_request_line()).ok_or(ConnectionError::NoRequestLineGiven)?;
 
     let app_id = match self.frontend_from_request(&host, &rl.uri) {
-      Some(app_id) => app_id,
+      Some(ApplicationRule::Id(app_id)) => app_id,
+      Some(ApplicationRule::Reject) => {
+        let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer403, None);
+        session.set_answer(DefaultAnswerStatus::Answer403, answer);
+        return Err(ConnectionError::Forbidden);
+      },
       None => {
         let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer404, None);
         session.set_answer(DefaultAnswerStatus::Answer404, answer);
@@ -1323,9 +1329,22 @@ mod tests {
     command.write_message(&ProxyRequest { id: String::from("Listener"), order: ProxyRequestData::AddHttpListener(config) });
     command.write_message(&ProxyRequest { id: String::from("Activate"), order: ProxyRequestData::ActivateListener(activate)});
 
-    let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    let front = HttpFront {
+      app_id: ApplicationRule::Id(String::from("app_1")),
+      address: "127.0.0.1:1024".parse().unwrap(),
+      hostname: String::from("localhost"),
+      path: PathRule::Prefix(String::from("/")),
+      position: RulePosition::Tree
+    };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });
-    let backend = proxy::Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), address: "127.0.0.1:1025".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+    let backend = proxy::Backend {
+      app_id: String::from("app_1"),
+      backend_id: String::from("app_1-0"),
+      address: "127.0.0.1:1025".parse().unwrap(),
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
+      sticky_id: None,
+      backup: None
+    };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1388,9 +1407,22 @@ mod tests {
     command.write_message(&ProxyRequest { id: String::from("Listener"), order: ProxyRequestData::AddHttpListener(config) });
     command.write_message(&ProxyRequest { id: String::from("Activate"), order: ProxyRequestData::ActivateListener(activate)});
 
-    let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    let front = HttpFront {
+      app_id: ApplicationRule::Id(String::from("app_1")),
+      address: "127.0.0.1:1031".parse().unwrap(),
+      hostname: String::from("localhost"),
+      path: PathRule::Prefix(String::from("/")),
+      position: RulePosition::Tree
+    };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });
-    let backend = proxy::Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+    let backend = proxy::Backend {
+      app_id: String::from("app_1"),
+      backend_id: String::from("app_1-0"),
+      address: "127.0.0.1:1028".parse().unwrap(),
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
+      sticky_id: None,
+      backup: None
+    };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1474,11 +1506,33 @@ mod tests {
     command.write_message(&ProxyRequest { id: String::from("Listener"), order: ProxyRequestData::AddHttpListener(config) });
     command.write_message(&ProxyRequest{ id: String::from("Activate"), order: ProxyRequestData::ActivateListener(activate)});
 
-    let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default(), answer_503: None };
+    let application = Application {
+      app_id: String::from("app_1"),
+      sticky_session: false,
+      https_redirect: true,
+      proxy_protocol: None,
+      load_balancing_policy: LoadBalancingAlgorithms::default(),
+      answer_503: None
+    };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddApplication(application) });
-    let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1041".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+
+    let front = HttpFront {
+      app_id: ApplicationRule::Id(String::from("app_1")),
+      address: "127.0.0.1:1041".parse().unwrap(),
+      hostname: String::from("localhost"),
+      path: PathRule::Prefix(String::from("/")),
+      position: RulePosition::Tree
+    };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddHttpFront(front) });
-    let backend = proxy::Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), address: "127.0.0.1:1040".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+
+    let backend = proxy::Backend {
+      app_id: String::from("app_1"),
+      backend_id: String::from("app_1-0"),
+      address: "127.0.0.1:1040".parse().unwrap(),
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
+      sticky_id: None,
+      backup: None
+    };
     command.write_message(&ProxyRequest { id: String::from("ID_IJKL"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1553,13 +1607,34 @@ mod tests {
     let uri3 = "/yolo/swag".to_owned();
 
     let mut fronts = Router::new();
-    fronts.add_http_front(HttpFront { app_id: app_id1, address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
-                              path: PathRule::Prefix(uri1), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFront { app_id: app_id2, address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
-                              path: PathRule::Prefix(uri2), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFront { app_id: app_id3, address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
-                              path: PathRule::Prefix(uri3), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFront { app_id: "app_1".to_owned(), address: "0.0.0.0:80".parse().unwrap(), hostname: "other.domain".to_owned(), path: PathRule::Prefix("/test".to_owned()), position: RulePosition::Tree });
+    fronts.add_http_front(HttpFront {
+      app_id: ApplicationRule::Id(app_id1),
+      address: "0.0.0.0:80".parse().unwrap(),
+      hostname: "lolcatho.st".to_owned(),
+      path: PathRule::Prefix(uri1),
+      position: RulePosition::Tree
+    });
+    fronts.add_http_front(HttpFront {
+      app_id: ApplicationRule::Id(app_id2),
+      address: "0.0.0.0:80".parse().unwrap(),
+      hostname: "lolcatho.st".to_owned(),
+      path: PathRule::Prefix(uri2),
+      position: RulePosition::Tree
+    });
+    fronts.add_http_front(HttpFront {
+      app_id: ApplicationRule::Id(app_id3),
+      address: "0.0.0.0:80".parse().unwrap(),
+      hostname: "lolcatho.st".to_owned(),
+      path: PathRule::Prefix(uri3),
+      position: RulePosition::Tree
+    });
+    fronts.add_http_front(HttpFront {
+      app_id: ApplicationRule::Id("app_1".to_owned()),
+      address: "0.0.0.0:80".parse().unwrap(),
+      hostname: "other.domain".to_owned(),
+      path: PathRule::Prefix("/test".to_owned()),
+      position: RulePosition::Tree
+    });
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
     let poll = Rc::new(RefCell::new(Poll::new().expect("could not create event loop")));
@@ -1586,10 +1661,10 @@ mod tests {
     let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test");
     let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag");
     let frontend5 = listener.frontend_from_request("domain", "/");
-    assert_eq!(frontend1.expect("should find frontend"), "app_1");
-    assert_eq!(frontend2.expect("should find frontend"), "app_1");
-    assert_eq!(frontend3.expect("should find frontend"), "app_2");
-    assert_eq!(frontend4.expect("should find frontend"), "app_3");
+    assert_eq!(frontend1.expect("should find frontend"), ApplicationRule::Id("app_1".to_string()));
+    assert_eq!(frontend2.expect("should find frontend"), ApplicationRule::Id("app_1".to_string()));
+    assert_eq!(frontend3.expect("should find frontend"), ApplicationRule::Id("app_2".to_string()));
+    assert_eq!(frontend4.expect("should find frontend"), ApplicationRule::Id("app_3".to_string()));
     assert_eq!(frontend5, None);
   }
 }

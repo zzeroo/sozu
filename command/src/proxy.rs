@@ -263,9 +263,16 @@ impl std::fmt::Display for PathRule {
   }
 }
 
+#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApplicationRule {
+  Id(String),
+  Reject,
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {
-    pub app_id:     String,
+    pub app_id:     ApplicationRule,
     pub address:    SocketAddr,
     pub hostname:   String,
     pub path:       PathRule,
@@ -710,11 +717,25 @@ mod tests {
 
   #[test]
   fn add_front_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
+    let raw_json = r#"{
+      "type": "ADD_HTTP_FRONT",
+      "data": {
+        "app_id": {
+          "ID": "xxx"
+        },
+        "hostname": "yyy",
+        "path": {
+          "PREFIX": "xxx"
+        },
+        "address": "127.0.0.1:4242",
+        "sticky_session": false
+      }
+    }"#;
+
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == ProxyRequestData::AddHttpFront(HttpFront{
-      app_id: String::from("xxx"),
+      app_id: ApplicationRule::Id(String::from("xxx")),
       hostname: String::from("yyy"),
       path: PathRule::Prefix(String::from("xxx")),
       address: "127.0.0.1:4242".parse().unwrap(),
@@ -724,11 +745,24 @@ mod tests {
 
   #[test]
   fn remove_front_test() {
-    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242"}}"#;
+    let raw_json = r#"{
+      "type": "REMOVE_HTTP_FRONT",
+      "data": {
+        "app_id": {
+          "ID": "xxx"
+        },
+        "hostname": "yyy",
+        "path": {
+          "PREFIX": "xxx"
+        },
+        "address": "127.0.0.1:4242"
+      }
+    }"#;
+
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == ProxyRequestData::RemoveHttpFront(HttpFront{
-      app_id: String::from("xxx"),
+      app_id: ApplicationRule::Id(String::from("xxx")),
       hostname: String::from("yyy"),
       path: PathRule::Prefix(String::from("xxx")),
       address: "127.0.0.1:4242".parse().unwrap(),
@@ -739,7 +773,18 @@ mod tests {
 
   #[test]
   fn add_backend_test() {
-    let raw_json = r#"{"type": "ADD_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080", "load_balancing_parameters": { "weight": 0 }}}"#;
+    let raw_json = r#"{
+      "type": "ADD_BACKEND",
+      "data": {
+        "app_id": "xxx",
+        "backend_id": "xxx-0",
+        "address": "0.0.0.0:8080",
+        "load_balancing_parameters": {
+          "weight": 0
+        }
+      }
+    }"#;
+
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == ProxyRequestData::AddBackend(Backend{
@@ -754,7 +799,15 @@ mod tests {
 
   #[test]
   fn remove_backend_test() {
-    let raw_json = r#"{"type": "REMOVE_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080"}}"#;
+    let raw_json = r#"{
+      "type": "REMOVE_BACKEND",
+      "data": {
+        "app_id": "xxx",
+        "backend_id": "xxx-0",
+        "address": "0.0.0.0:8080"
+      }
+    }"#;
+
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == ProxyRequestData::RemoveBackend(RemoveBackend {
@@ -766,11 +819,24 @@ mod tests {
 
   #[test]
   fn http_front_crash_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242"}}"#;
+    let raw_json = r#"{
+      "type": "ADD_HTTP_FRONT",
+      "data": {
+        "app_id": {
+          "ID": "aa"
+        },
+        "hostname": "cltdl.fr",
+        "path": {
+          "PREFIX": ""
+        },
+        "address": "127.0.0.1:4242"
+      }
+    }"#;
+
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == ProxyRequestData::AddHttpFront(HttpFront{
-      app_id: String::from("aa"),
+      app_id: ApplicationRule::Id(String::from("aa")),
       hostname: String::from("cltdl.fr"),
       path: PathRule::Prefix(String::from("")),
       address: "127.0.0.1:4242".parse().unwrap(),
@@ -780,11 +846,21 @@ mod tests {
 
   #[test]
   fn http_front_crash_test2() {
-    let raw_json = r#"{"app_id": "aa", "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
+    let raw_json = r#"{
+      "app_id": {
+        "ID": "aa"
+      },
+      "hostname": "cltdl.fr",
+      "path": {
+        "PREFIX": ""
+      },
+      "address": "127.0.0.1:4242"
+    }"#;
+
     let front: HttpFront = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}",front);
     assert!(front == HttpFront{
-      app_id: String::from("aa"),
+      app_id: ApplicationRule::Id(String::from("aa")),
       hostname: String::from("cltdl.fr"),
       path: PathRule::Prefix(String::from("")),
       address: "127.0.0.1:4242".parse().unwrap(),

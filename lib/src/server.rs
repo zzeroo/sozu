@@ -19,7 +19,7 @@ use sozu_command::state::{ConfigState,get_application_ids_by_domain, get_certifi
 use sozu_command::proxy::{ProxyRequestData,MessageId,ProxyResponse, ProxyEvent,
   ProxyResponseData,ProxyResponseStatus,ProxyRequest,Topic,Query,QueryAnswer,
   QueryApplicationType,TlsProvider,ListenerType,HttpsListener,QueryAnswerCertificate,
-  QueryCertificateType};
+  QueryCertificateType,ApplicationRule};
 use sozu_command::buffer::Buffer;
 
 use {SessionResult,ConnectionError,Protocol,ProxySession, Listener,
@@ -534,7 +534,12 @@ impl Server {
             },
             &QueryApplicationType::Domain(ref domain) => {
               let app_ids = get_application_ids_by_domain(&self.config_state, domain.hostname.clone(), domain.path.clone());
-              let answer = app_ids.iter().map(|ref app_id| self.config_state.application_state(app_id)).collect();
+              let answer = app_ids.iter().filter_map(|ref app_rule| if let ApplicationRule::Id(app_id) = app_rule {
+                  Some(self.config_state.application_state(app_id))
+                } else {
+                  None
+                }
+              ).collect();
 
               QueryAnswer::Applications(answer)
             }
@@ -1038,7 +1043,8 @@ impl Server {
       Ok(BackendConnectAction::New) => {
       },
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) |
-        Err(ConnectionError::HttpsRedirect) | Err(ConnectionError::InvalidHost) => {
+        Err(ConnectionError::HttpsRedirect) | Err(ConnectionError::InvalidHost) |
+        Err(ConnectionError::Forbidden) => {
         if protocol == Protocol::TCP {
           self.close_session(token);
         }

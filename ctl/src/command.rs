@@ -6,7 +6,7 @@ use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, Tcp
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
   AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend, TcpListener, ListenerType,
   TlsVersion, QueryCertificateType, QueryAnswerCertificate, RemoveListener, ActivateListener, DeactivateListener,
-  PathRule, RulePosition};
+  PathRule, RulePosition, ApplicationRule};
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};
@@ -770,7 +770,7 @@ pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeo
   address: SocketAddr, hostname: &str, path: &str, https: bool) {
   if https {
     order_command(channel, timeout, ProxyRequestData::AddHttpsFront(HttpFront {
-      app_id: String::from(app_id),
+      app_id: ApplicationRule::Id(String::from(app_id)),
       address,
       hostname: String::from(hostname),
       path: PathRule::Prefix(String::from(path)),
@@ -778,7 +778,7 @@ pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeo
     }));
   } else {
     order_command(channel, timeout, ProxyRequestData::AddHttpFront(HttpFront {
-      app_id: String::from(app_id),
+      app_id: ApplicationRule::Id(String::from(app_id)),
       address,
       hostname: String::from(hostname),
       path: PathRule::Prefix(String::from(path)),
@@ -791,7 +791,7 @@ pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>, ti
   address: SocketAddr, hostname: &str, path: &str, https: bool) {
   if https {
     order_command(channel, timeout, ProxyRequestData::RemoveHttpsFront(HttpFront {
-      app_id: String::from(app_id),
+      app_id: ApplicationRule::Id(String::from(app_id)),
       address,
       hostname: String::from(hostname),
       path: PathRule::Prefix(String::from(path)),
@@ -799,7 +799,7 @@ pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>, ti
     }));
   } else {
     order_command(channel, timeout, ProxyRequestData::RemoveHttpFront(HttpFront {
-      app_id: String::from(app_id),
+      app_id: ApplicationRule::Id(String::from(app_id)),
       address,
       hostname: String::from(hostname),
       path: PathRule::Prefix(String::from(path)),
@@ -1097,7 +1097,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
 
               for (ref key, ref values) in frontend_data.iter() {
                 let mut row = Vec::new();
-                row.push(cell!(key.app_id));
+                row.push(cell!(format!("{:?}", key.app_id)));
                 row.push(cell!(key.hostname));
                 row.push(cell!(key.path));
 
@@ -1118,7 +1118,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
 
               for (ref key, ref values) in https_frontend_data.iter() {
                 let mut row = Vec::new();
-                row.push(cell!(key.app_id));
+                row.push(cell!(format!("{:?}", key.app_id)));
                 row.push(cell!(key.hostname));
                 row.push(cell!(key.path));
 

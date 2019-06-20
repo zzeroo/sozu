@@ -13,7 +13,8 @@ use toml;
 
 use proxy::{CertificateAndKey,ProxyRequestData,HttpFront,TcpFront,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
-  Application, TlsVersion,ActivateListener,ListenerType,RulePosition,PathRule};
+  Application, TlsVersion,ActivateListener,ListenerType,RulePosition,PathRule,
+  ApplicationRule};
 
 use command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
 
@@ -255,6 +256,8 @@ pub struct FileAppFrontendConfig {
   pub certificate_chain: Option<String>,
   #[serde(default)]
   pub position:          RulePosition,
+  #[serde(default)]
+  pub reject:            bool,
 }
 
 impl FileAppFrontendConfig {
@@ -313,7 +316,8 @@ impl FileAppFrontendConfig {
       key:               key_opt,
       certificate_chain: chain_opt,
       position:          self.position,
-      path
+      path,
+      reject:            self.reject,
     })
   }
 }
@@ -486,11 +490,19 @@ pub struct HttpFrontendConfig {
   pub certificate_chain: Option<Vec<String>>,
   #[serde(default)]
   pub position:          RulePosition,
+  #[serde(default)]
+  pub reject:            bool,
 }
 
 impl HttpFrontendConfig {
-  pub fn generate_orders(&self, app_id: &str) -> Vec<ProxyRequestData> {
+  pub fn generate_orders(&self, app_id: Option<&str>) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
+
+    let app_rule = app_id.map(|s| if self.reject {
+      ApplicationRule::Reject
+    } else {
+      ApplicationRule::Id(s.to_string())
+    }).unwrap_or(ApplicationRule::Reject);
 
     if self.key.is_some() && self.certificate.is_some() {
 
@@ -505,7 +517,7 @@ impl HttpFrontendConfig {
       }));
 
       v.push(ProxyRequestData::AddHttpsFront(HttpFront {
-        app_id:      app_id.to_string(),
+        app_id:      app_rule,
         address:     self.address,
         hostname:    self.hostname.clone(),
         path:        self.path.clone(),
@@ -514,7 +526,7 @@ impl HttpFrontendConfig {
     } else {
       //create the front both for HTTP and HTTPS if possible
       v.push(ProxyRequestData::AddHttpFront(HttpFront {
-        app_id:     app_id.to_string(),
+        app_id:     app_rule,
         address:    self.address,
         hostname:   self.hostname.clone(),
         path:       self.path.clone(),
@@ -552,7 +564,7 @@ impl HttpAppConfig {
     }));
 
     for frontend in &self.frontends {
-      let mut orders = frontend.generate_orders(&self.app_id);
+      let mut orders = frontend.generate_orders(Some(&self.app_id));
       v.extend(orders.drain(..));
     }
 
