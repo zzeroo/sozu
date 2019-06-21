@@ -6,7 +6,6 @@ use pool::Reset;
 #[derive(Debug,PartialEq,Clone)]
 pub struct Buffer {
   memory:   Vec<u8>,
-  capacity: usize,
   position: usize,
   end:      usize
 }
@@ -17,7 +16,6 @@ impl Buffer {
     v.extend(repeat(0).take(capacity));
     Buffer {
       memory:   v,
-      capacity,
       position: 0,
       end:      0
     }
@@ -26,19 +24,17 @@ impl Buffer {
   pub fn from_slice(sl: &[u8]) -> Buffer {
     Buffer {
       memory:   Vec::from(sl),
-      capacity: sl.len(),
       position: 0,
       end:      sl.len()
     }
   }
 
   pub fn grow(&mut self, new_size: usize) -> bool {
-    if self.capacity >= new_size {
+    if self.capacity() >= new_size {
       return false;
     }
 
     self.memory.resize(new_size, 0);
-    self.capacity = new_size;
     true
   }
 
@@ -47,11 +43,11 @@ impl Buffer {
   }
 
   pub fn available_space(&self) -> usize {
-    self.capacity - self.end
+    self.capacity() - self.end
   }
 
   pub fn capacity(&self) -> usize {
-    self.capacity
+    self.memory.capacity()
   }
 
   pub fn empty(&self) -> bool {
@@ -61,7 +57,7 @@ impl Buffer {
   pub fn consume(&mut self, count: usize) -> usize {
     let cnt        = cmp::min(count, self.available_data());
     self.position += cnt;
-    if self.position > self.capacity / 2 {
+    if self.position > self.capacity() / 2 {
       //trace!("consume shift: pos {}, end {}", self.position, self.end);
       self.shift();
     }
@@ -89,7 +85,8 @@ impl Buffer {
   }
 
   pub fn space(&mut self) -> &mut[u8] {
-    &mut self.memory[self.end..self.capacity]
+    let capacity = self.capacity();
+    &mut self.memory[self.end..capacity]
   }
 
   pub fn shift(&mut self) {
@@ -124,7 +121,7 @@ impl Buffer {
   pub fn replace_slice(&mut self, data: &[u8], start: usize, length: usize) -> Option<usize> {
     let data_len = data.len();
     if start + length > self.available_data() ||
-      self.position + start + data_len > self.capacity {
+      self.position + start + data_len > self.capacity() {
       return None
     }
 
@@ -151,7 +148,7 @@ impl Buffer {
   pub fn insert_slice(&mut self, data: &[u8], start: usize) -> Option<usize> {
     let data_len = data.len();
     if start > self.available_data() ||
-      self.position + self.end + data_len > self.capacity {
+      self.position + self.end + data_len > self.capacity() {
       return None
     }
 
