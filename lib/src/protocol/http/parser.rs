@@ -897,7 +897,7 @@ impl RequestState {
     }
   }
 
-  pub fn is_proxying(&self) -> bool {
+  pub fn headers_parsed(&self) -> bool {
     match *self {
       RequestState::Request(_, _, _)            |
       RequestState::RequestWithBody(_, _, _, _) |

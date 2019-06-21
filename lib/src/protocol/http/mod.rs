@@ -660,7 +660,7 @@ impl<Front:SocketHandler> Http<Front> {
         incr!("http.requests");
       }
 
-      if unwrap_msg!(self.request.as_ref()).has_host() {
+      if unwrap_msg!(self.request.as_ref()).headers_parsed() {
         self.back_readiness.interest.insert(Ready::writable());
         return SessionResult::ConnectBackend;
       } else {
