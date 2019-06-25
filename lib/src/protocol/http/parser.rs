@@ -1,12 +1,24 @@
 use sozu_command::buffer::Buffer;
 use buffer_queue::BufferQueue;
-use protocol::StickySession;
+use protocol::http::StickySession;
 use super::cookies::{RequestCookie, parse_request_cookies};
 
-use nom::{HexDisplay,IResult,Offset};
-
-use nom::{AsChar, character::{is_alphanumeric, is_space}};
-use nom::bytes::streaming::take_while;
+use nom::{
+  HexDisplay,IResult,Offset,AsChar,Err,Needed,
+  error::ErrorKind,
+  character::{
+    is_alphanumeric, is_space,
+    streaming::{char, one_of},
+    complete::digit1 as digit_complete
+  },
+  bytes::{
+    self,
+    streaming::{tag, take, take_while, take_while1},
+    complete::{take_while1 as take_while1_complete}
+  },
+  sequence::{preceded, terminated, tuple},
+  combinator::{opt, map_res}
+};
 
 use url::Url;
 
@@ -31,20 +43,30 @@ fn is_token_char(i: u8) -> bool {
   is_alphanumeric(i) ||
   b"!#$%&'*+-.^_`|~".contains(&i)
 }
-named!(pub token, take_while!(is_token_char));
+
+fn token(i:&[u8]) -> IResult<&[u8], &[u8]> {
+  take_while(is_token_char)(i)
+}
 
 fn is_status_token_char(i: u8) -> bool {
   i >= 32 && i != 127
 }
 
-named!(pub status_token, take_while!(is_status_token_char));
+fn status_token(i:&[u8]) -> IResult<&[u8], &[u8]> {
+  take_while(is_status_token_char)(i)
+}
 
 fn is_ws(i: u8) -> bool {
   i == b' ' && i == b'\t'
 }
 
-named!(pub sp<char>, char!(' '));
-named!(pub crlf, tag!("\r\n"));
+fn sp(i:&[u8]) -> IResult<&[u8], char> {
+  char(' ')(i)
+}
+
+fn crlf(i:&[u8]) -> IResult<&[u8], &[u8]> {
+  tag("\r\n")(i)
+}
 
 fn is_vchar(i: u8) -> bool {
   i > 32 && i <= 126
@@ -66,10 +88,13 @@ fn is_header_value_char(i: u8) -> bool {
   i == 9 || (i >= 32 && i <= 126)
 }
 
-named!(pub vchar_1, take_while!(is_vchar));
-named!(pub vchar_ws_1, take_while!(is_vchar_or_ws));
+fn vchar_1(i:&[u8]) -> IResult<&[u8], &[u8]> {
+  take_while(is_vchar)(i)
+}
 
-named!(digit_complete, take_while1_complete!(|item:u8| item.is_dec_digit()));
+fn vchar_ws_1(i:&[u8]) -> IResult<&[u8], &[u8]> {
+  take_while(is_vchar_or_ws)(i)
+}
 
 #[derive(PartialEq,Debug,Clone)]
 pub enum Method {
@@ -194,52 +219,43 @@ impl RStatusLine {
   }
 }
 
-named!(pub http_version<Version>,
-do_parse!(
-  tag!("HTTP/") >>
-  tag!("1.") >>
-  minor: one_of!("01") >> (
-    if minor == '0' {
-      Version::V10
-    } else {
-      Version::V11
-    }
-  )
-)
-);
+fn http_version(i:&[u8]) -> IResult<&[u8], Version> {
+  let (i, _) = tag("HTTP/1.")(i)?;
+  let (i, minor) = one_of("01")(i)?;
 
-named!(pub request_line<RequestLine>,
-do_parse!(
-  method: token >>
-  sp >>
-  uri: vchar_1 >> // ToDo proper URI parsing?
-  sp >>
-  version: http_version >>
-  crlf >> (
-    RequestLine {
-      method: method,
-      uri: uri,
-      version: version
-    }
-  )
-)
-);
+  Ok((i, if minor == '0' {
+    Version::V10
+  } else {
+    Version::V11
+  }))
+}
 
-named!(pub status_line<StatusLine>,
-do_parse!(
-  version: http_version >>
-           sp           >>
-  status:  take!(3)     >>
-           sp           >>
-  reason:  status_token >>
-           crlf         >>
-  (StatusLine {
+fn request_line(i:&[u8]) -> IResult<&[u8], RequestLine> {
+  let (i, method) = token(i)?;
+  let (i, _) = sp(i)?;
+  let (i, uri) = vchar_1(i)?; // ToDo proper URI parsing?
+  let (i, _) = sp(i)?;
+  let (i, version) = http_version(i)?;
+  let (i, _) = crlf(i)?;
+
+  Ok((i, RequestLine {
+    method: method,
+    uri: uri,
+    version: version
+  }))
+}
+
+fn status_line(i:&[u8]) -> IResult<&[u8], StatusLine> {
+  let (i, (version, _, status, _, reason, _)) =
+    tuple((http_version, sp, take(3usize), sp, status_token, crlf))(i)?;
+
+  Ok((i, StatusLine {
     version: version,
     status: status,
     reason: reason,
-  })
-)
-);
+  }))
+
+}
 
 #[derive(PartialEq,Debug)]
 pub struct Header<'a> {
@@ -247,20 +263,16 @@ pub struct Header<'a> {
     pub value: &'a [u8]
 }
 
-named!(pub message_header<Header>,
-do_parse!(
-  name: token >>
-  tag!(":")   >>
-  opt!(take_while!(is_space))    >>
-  value: take_while!(is_header_value_char) >> // ToDo handle folding?
-  crlf >> (
-    Header {
-      name: name,
-      value: value
-    }
-  )
-)
-);
+fn message_header(i:&[u8]) -> IResult<&[u8], Header> {
+  // ToDo handle folding?
+  let (i, (name, _, _, value, _)) =
+    tuple((token, tag(":"), take_while(is_space), take_while(is_header_value_char), crlf))(i)?;
+
+  Ok((i, Header {
+    name: name,
+    value: value
+  }))
+}
 
 //not a space nor a comma
 //
@@ -278,26 +290,9 @@ fn is_single_header_value_char(i: u8) -> bool {
   i > 33 && i <= 126 && i != 44
 }
 
-named!(pub single_header_value, take_while1_complete!(is_single_header_value_char));
-
-pub fn comma_separated_header_values(input:&[u8]) -> Option<Vec<&[u8]>> {
-  let res: IResult<&[u8], Vec<&[u8]>> =
-    separated_list!(input,
-      delimited!(
-        opt!(complete!(sp)),
-        complete!(char!(',')),
-        opt!(sp)
-      ),
-      single_header_value
-    );
-  if let Ok((_,o)) = res {
-    Some(o)
-  } else {
-    None
-  }
+fn single_header_value(i:&[u8]) -> IResult<&[u8], &[u8]> {
+  take_while1_complete(is_single_header_value_char)(i)
 }
-
-named!(pub headers< Vec<Header> >, terminated!(many0!(message_header), opt!(crlf)));
 
 #[cfg(feature = "tolerant-http1-parser")]
 fn is_hostname_char(i: u8) -> bool {
@@ -325,29 +320,28 @@ fn is_hostname_char(i: u8) -> bool {
   b"-.".contains(&i)
 }
 
-named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>,
-  terminated!(
-    pair!(
-      take_while1_complete!(is_hostname_char),
-      opt!(complete!(preceded!(
-        tag!(":"),
-        digit_complete
-      )))
-    ),
-    empty!()
-  )
-);
+// FIXME: convert port to u16 here
+pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<&[u8]>)> {
+  let (i, host) = take_while1_complete(is_hostname_char)(i)?;
+  let (i, port) = opt(preceded(bytes::complete::tag(":"), digit_complete))(i)?;
+
+  if !i.is_empty() {
+    Err(Err::Error((i, ErrorKind::Eof)))
+  } else {
+    Ok((i, (host, port)))
+  }
+}
 
 use std::str::from_utf8;
-use nom::{Err,Needed};
 
 pub fn is_hex_digit(chr: u8) -> bool {
   (chr >= 0x30 && chr <= 0x39) ||
   (chr >= 0x41 && chr <= 0x46) ||
   (chr >= 0x61 && chr <= 0x66)
 }
+
 pub fn chunk_size(input: &[u8]) -> IResult<&[u8], usize> {
-  let (i, s) = try_parse!(input, map_res!(take_while!(is_hex_digit), from_utf8));
+  let (i, s) = map_res(take_while(is_hex_digit), from_utf8)(input)?;
   if i.is_empty() {
     return Err(Err::Incomplete(Needed::Unknown));
   }
@@ -357,10 +351,17 @@ pub fn chunk_size(input: &[u8]) -> IResult<&[u8], usize> {
   }
 }
 
-named!(pub chunk_header<usize>, terminated!(chunk_size, crlf));
-named!(pub end_of_chunk_and_header<usize>, preceded!(crlf, chunk_header));
+fn chunk_header(i: &[u8]) -> IResult<&[u8], usize> {
+  terminated(chunk_size, crlf)(i)
+}
 
-named!(pub trailer_line, terminated!(take_while1!(is_header_value_char), crlf));
+fn end_of_chunk_and_header(i: &[u8]) -> IResult<&[u8], usize> {
+  preceded(crlf, chunk_header)(i)
+}
+
+fn trailer_line(i: &[u8]) -> IResult<&[u8], &[u8]> {
+  terminated(take_while1(is_header_value_char), crlf)(i)
+}
 
 #[derive(PartialEq,Debug,Clone,Copy)]
 pub enum Chunk {
