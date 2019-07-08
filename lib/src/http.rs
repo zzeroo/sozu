@@ -825,28 +825,11 @@ impl Proxy {
   }
 
   pub fn add_application(&mut self, mut application: Application) {
-    /*
-    if let Some(answer_503) = application.answer_503.as_ref() {
-      for l in self.listeners.values_mut() {
-        l.answers.borrow_mut().add_custom_answer(&application.app_id, &answer_503);
-      }
-    }
-    */
-    error!("FIXME ADD_APPLICATION ANSWERS");
-
     self.applications.insert(application.app_id.clone(), application);
   }
 
   pub fn remove_application(&mut self, app_id: &str) {
     self.applications.remove(app_id);
-
-    error!("FIXME REMOVE_APPLICATION ANSWERS");
-
-    /*
-    for l in self.listeners.values_mut() {
-      l.answers.borrow_mut().remove_custom_answer(app_id);
-    }
-    */
   }
 }
 
@@ -1131,9 +1114,17 @@ impl super::Listener for ListenerWrapper {
   }
 
   fn notify(&self, message: ProxyRequest) -> ProxyResponse {
-    // ToDo temporary
-    //trace!("{} notified", message);
     match message.order {
+      ProxyRequestData::AddApplication(application) => {
+        if let Some(answer_503) = application.answer_503.as_ref() {
+          self.inner.borrow().answers.borrow_mut().add_custom_answer(&application.app_id, &answer_503);
+        }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+      },
+      ProxyRequestData::RemoveApplication(application) => {
+        self.inner.borrow().answers.borrow_mut().remove_custom_answer(&application);
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+      },
       ProxyRequestData::AddHttpFront(front) => {
         debug!("{} add front {:?}", message.id, front);
         match self.inner.borrow_mut().add_http_front(front) {

@@ -399,6 +399,16 @@ impl super::super::Listener for ListenerWrapper {
     // ToDo temporary
     //trace!("{} notified", message);
     match message.order {
+      ProxyRequestData::AddApplication(application) => {
+        if let Some(answer_503) = application.answer_503.as_ref() {
+          self.inner.borrow_mut().answers.borrow_mut().add_custom_answer(&application.app_id, &answer_503);
+        }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+      },
+      ProxyRequestData::RemoveApplication(application) => {
+        self.inner.borrow().answers.borrow_mut().remove_custom_answer(&application);
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+      },
       ProxyRequestData::AddHttpsFront(front) => {
         debug!("{} add front {:?}", message.id, front);
         match self.inner.borrow_mut().add_https_front(front) {
@@ -484,7 +494,6 @@ impl super::super::Listener for ListenerWrapper {
 pub struct Proxy {
   pub applications: HashMap<AppId, Application>,
   pub backends:     Rc<RefCell<BackendMap>>,
-  custom_answers:   HashMap<AppId, CustomAnswers>,
   pool:             Rc<RefCell<Pool<Buffer>>>,
   pub poll:         Rc<RefCell<Poll>>,
 }
@@ -493,7 +502,6 @@ impl Proxy {
   pub fn new(pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>, poll: Rc<RefCell<Poll>>) -> Proxy {
     Proxy {
       applications: HashMap::new(),
-      custom_answers: HashMap::new(),
       backends,
       pool,
       poll,
@@ -506,19 +514,11 @@ impl Proxy {
   }
 
   pub fn add_application(&mut self, mut application: Application) {
-    if let Some(answer_503) = application.answer_503.take() {
-      self.custom_answers
-        .entry(application.app_id.clone())
-        .and_modify(|c| c.ServiceUnavailable = Some(Rc::new(answer_503.clone().into_bytes())))
-        .or_insert(CustomAnswers{ ServiceUnavailable: Some(Rc::new(answer_503.into_bytes())) });
-    }
-
     self.applications.insert(application.app_id.clone(), application);
   }
 
   pub fn remove_application(&mut self, app_id: &str) {
     self.applications.remove(app_id);
-    self.custom_answers.remove(app_id);
   }
 }
 

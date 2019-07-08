@@ -603,7 +603,17 @@ impl Server {
         }
         return;
       },
-      None => {},
+      None => {
+        match message.order {
+          ProxyRequestData::AddApplication(_) | ProxyRequestData::RemoveApplication(_) => {
+            //FIXME: return an error message if necessary
+            for listener in self.listeners.values_mut() {
+              listener.notify(message.clone());
+            }
+          },
+          _ => {}
+        }
+      },
     }
 
     match message {
