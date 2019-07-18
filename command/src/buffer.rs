@@ -35,6 +35,9 @@ impl Buffer {
     }
 
     self.memory.resize(new_size, 0);
+    if self.capacity() > self.memory.len() {
+      self.memory.resize(self.capacity(), 0);
+    }
     true
   }
 
