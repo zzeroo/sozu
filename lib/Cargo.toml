@@ -43,7 +43,7 @@ idna = "^0.2"
 mio-extras = "^2.0"
 hashbrown = "0.1"
 regex = "1.1"
-cookie-factory = "^0.2"
+cookie-factory = "^0.3"
 hpack = "^0.3"
 
 [dev-dependencies]
