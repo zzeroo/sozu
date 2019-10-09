@@ -346,6 +346,41 @@ impl<'a> Iterator for ValueIterator<'a> {
   }
 }
 
+fn parse_and_validate(input: &[u8]) -> ParsedRequest {
+  let mut state = RequestParser::Initial;
+
+  loop {
+    let previous_position = state.position();
+
+    state = state.parse(&input[..]);
+
+    println!("state is now: {:?}", state);
+    if state.is_error() {
+      println!("got an error");
+      break;
+    }
+
+    if state.position() == previous_position {
+      println!("position did not change, failed advancing");
+      break;
+    }
+
+    if state.is_finished() {
+      println!("done");
+      break;
+    }
+  }
+
+  let req = state.validate(&input[..]).unwrap();
+
+  println!("validated request: {:?}", req);
+  for (name, value) in req.headers.iter() {
+    println!("{} -> {}", name, value);
+  }
+
+  req
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
