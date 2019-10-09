@@ -25,6 +25,7 @@ use std::collections::HashSet;
 mod request;
 mod response;
 mod request2;
+mod response2;
 #[cfg(test)]
 mod tests;
 
