@@ -409,7 +409,6 @@ mod tests {
       println!("{} -> {}", name, value);
     }
 
-    println!("requesting Host header: {}", req.headers.get(&ParsedHeaderName::Ref(&b"hOsT"[..])).unwrap());
-    //panic!();
+    println!("requesting content length header: {}", req.headers.get(&ParsedHeaderName::Ref(&b"Content-LeNGTH"[..])).unwrap());
   }
 }
