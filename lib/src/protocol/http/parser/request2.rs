@@ -86,6 +86,7 @@ impl RequestParser {
 
           if headers.contains_key(&name) {
             // we refuse duplicate headers
+            // FIXME: it should be accepted for headers that can be represented as a comma separated list
             RequestParser::Error(position, Some(rl), Some(headers))
           } else {
             headers.insert(name, h);
@@ -151,10 +152,18 @@ impl RequestParser {
         parsed_headers.insert(ParsedHeaderName::Ref(name), ParsedHeaderValue { span, value: Cow::from(value) });
       }
 
+      let length = if compare_no_case(request_line.method, &b"HEAD"[..]) {
+        BodyLength::None
+      } else {
+        BodyLength::None
+      };
+
       Some(ParsedRequest {
         request_line,
         headers: parsed_headers,
         header_end: *position,
+        connection: Connection::new(),
+        length,
       })
     } else {
       None
@@ -167,9 +176,23 @@ pub struct ParsedRequest<'a> {
   pub request_line: ParsedRequestLine<'a>,
   pub headers: HashMap<ParsedHeaderName<'a>, ParsedHeaderValue<'a>>,
   pub header_end: usize,
+  pub connection: Connection,
+  pub length: BodyLength,
 }
 
 impl<'a> ParsedRequest<'a> {
+  pub fn method(&'a self) -> &'a[u8] {
+    self.request_line.method
+  }
+
+  pub fn uri(&'a self) -> &'a[u8] {
+    self.request_line.uri
+  }
+
+  pub fn version(&'a self) -> Version {
+    self.request_line.version
+  }
+
   pub fn host(&'a self) -> Option<&'a[u8]> {
     self.headers.get(&ParsedHeaderName::Ref(b"Host")).map(|v| v.as_slice())
   }
@@ -178,10 +201,20 @@ impl<'a> ParsedRequest<'a> {
     compare_no_case(self.request_line.method, &b"HEAD"[..])
   }
 
+  pub fn connection(&'a self) -> &'a Connection {
+    &self.connection
+  }
   /*pub fn length_information(&'a self) -> Option<LengthInformation> {
     LengthInformation::Chunked 
     LengthInformation::Length(sz)
   }*/
+}
+
+#[derive(Debug,Clone,PartialEq)]
+pub enum BodyLength {
+  None,
+  Length(usize),
+  Chunked,
 }
 
 #[derive(Debug,Clone,PartialEq)]
