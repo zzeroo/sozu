@@ -201,11 +201,49 @@ impl ResponseParser {
         }
       };
 
+      // https://tools.ietf.org/html/rfc7230#section-6.1
+      // Connection header handling
+      let mut connection = Connection::new();
+
+      if let Some(v) = parsed_headers.get(&ParsedHeaderName::Ref(&b"Connection"[..])) {
+        for elem in ValueIterator::new(&v.value) {
+
+          if compare_no_case(elem, b"upgrade") {
+            connection.has_upgrade = true;
+
+            if let Some(u) = parsed_headers.get(&ParsedHeaderName::Ref(&b"Upgrade"[..])) {
+              connection.upgrade = Some(String::from(from_utf8(&u.value).expect("should be valid ascii")));
+            }
+          } else if compare_no_case(elem, b"close") {
+            if connection.keep_alive.is_none() {
+              connection.keep_alive = Some(false);
+            } else {
+              return None;
+            }
+          } else if compare_no_case(elem, b"keep-alive") {
+            if connection.keep_alive.is_none() {
+              connection.keep_alive = Some(true);
+            } else {
+              return None;
+            }
+          } else {
+            // FIXME: add headers to connection.to_delete
+          }
+        }
+      }
+
+      if connection.keep_alive.is_none() {
+        match status_line.version {
+          Version::V10 => connection.keep_alive = Some(false),
+          Version::V11 => connection.keep_alive = Some(true),
+        }
+      }
+
       Some(ParsedResponse {
         status_line,
         headers: parsed_headers,
         header_end: *position,
-        connection: Connection::new(),
+        connection,
         length,
       })
     } else {
@@ -562,5 +600,59 @@ mod tests {
     let res = parse_and_validate(input, false).unwrap();
     assert_eq!(res.length, BodyLength::Chunked);
     assert!(res.headers.get(&ParsedHeaderName::Ref(&b"Content-Length"[..])).is_none());
+  }
+
+  #[test]
+  fn connection_close() {
+    let input =
+        b"HTTP/1.1 200 OK\r\n\
+          Host: lolcatho.st\r\n\
+          Connection: close\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.length, BodyLength::Length(100));
+    assert_eq!(res.connection.keep_alive, Some(false));
+  }
+
+  #[test]
+  fn connection_keep_alive() {
+    let input =
+        b"HTTP/1.0 200 OK\r\n\
+          Host: lolcatho.st\r\n\
+          Connection: keep-alive\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.length, BodyLength::Length(100));
+    assert_eq!(res.connection.keep_alive, Some(true));
+  }
+
+  #[test]
+  fn http1_0_no_connection_header() {
+    let input =
+        b"HTTP/1.0 200 OK\r\n\
+          Host: lolcatho.st\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.length, BodyLength::Length(100));
+    assert_eq!(res.connection.keep_alive, Some(false));
+  }
+
+  #[test]
+  fn http1_1_no_connection_header() {
+    let input =
+        b"HTTP/1.1 200 OK\r\n\
+          Host: lolcatho.st\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.length, BodyLength::Length(100));
+    assert_eq!(res.connection.keep_alive, Some(true));
   }
 }
