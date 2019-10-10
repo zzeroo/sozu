@@ -196,7 +196,7 @@ impl ResponseParser {
           if chunked {
             BodyLength::Chunked
           } else {
-            BodyLength::None
+            BodyLength::CloseDelimited
           }
         }
       };
@@ -254,6 +254,7 @@ pub enum BodyLength {
   None,
   Length(usize),
   Chunked,
+  CloseDelimited,
 }
 
 #[derive(Debug,Clone,PartialEq)]
@@ -500,6 +501,16 @@ mod tests {
 
     let res = parse_and_validate(input, false).unwrap();
     assert_eq!(res.length, BodyLength::Chunked);
+  }
+
+  #[test]
+  fn body_without_length_info() {
+    let input =
+        b"HTTP/1.1 200 OK\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.length, BodyLength::CloseDelimited);
   }
 
 

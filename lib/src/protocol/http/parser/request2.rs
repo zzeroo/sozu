@@ -241,6 +241,7 @@ pub enum BodyLength {
   None,
   Length(usize),
   Chunked,
+  CloseDelimited,
 }
 
 #[derive(Debug,Clone,PartialEq)]
@@ -479,6 +480,17 @@ mod tests {
     let res = parse_and_validate(input).unwrap();
     assert_eq!(res.method(), &b"POST"[..]);
     assert_eq!(res.length, BodyLength::Length(100));
+  }
+
+  #[test]
+  fn post_without_length_info() {
+    let input =
+        b"POST / HTTP/1.1\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input).unwrap();
+    assert_eq!(res.method(), &b"POST"[..]);
+    assert_eq!(res.length, BodyLength::None);
   }
 
   //https://tools.ietf.org/html/rfc7230#section-3.3.3
