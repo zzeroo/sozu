@@ -26,6 +26,7 @@ mod request;
 mod response;
 mod request2;
 mod response2;
+mod uri;
 #[cfg(test)]
 mod tests;
 

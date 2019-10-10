@@ -4,15 +4,14 @@ use buffer_queue::BufferQueue;
 
 use nom::{HexDisplay,IResult,Offset,Err, character::complete::char, sequence::tuple, combinator::opt};
 
-use url::Url;
-
 use std::str::{self, from_utf8};
 use std::convert::From;
 use std::collections::{HashMap,BTreeMap};
 use std::borrow::Cow;
 
 use super::{BufferMove, LengthInformation, RRequestLine, Connection, Chunk, Host, HeaderValue, TransferEncodingValue,
-  Method, Version, Continue, Header, message_header, request_line, crlf, compare_no_case, sp, single_header_value};
+  Method, Version, Continue, Header, message_header, request_line, crlf, compare_no_case, sp, single_header_value,
+  uri::{Uri, absolute_path, uri}};
 
 #[derive(Debug,Clone,PartialEq,Eq,PartialOrd,Ord)]
 struct BufferSlice {
@@ -143,6 +142,12 @@ impl RequestParser {
         version: rl.version,
       };
 
+      let uri = if let Some(u) = HttpUri::parse(request_line.uri) {
+        u
+      } else {
+        return None;
+      };
+
       let mut parsed_headers: HashMap<ParsedHeaderName<'buffer>, ParsedHeaderValue<'buffer>> = HashMap::new();
       for (name, HeaderValueParser { span, value }) in headers.iter() {
         let name = name.to_slice();
@@ -151,6 +156,17 @@ impl RequestParser {
 
         parsed_headers.insert(ParsedHeaderName::Ref(name), ParsedHeaderValue { span, value: Cow::from(value) });
       }
+
+      // https://tools.ietf.org/html/rfc7230#section-5.4
+      // absolute URI authority and host header must match
+      if let HttpUri::Absolute(ref u) = &uri {
+        if let Some(ref mut v) = parsed_headers.get_mut(&ParsedHeaderName::Ref(&b"Host"[..])) {
+          if ! compare_no_case(&v.value, u.authority.host_and_port) {
+            v.value = Cow::Owned(Vec::from(u.authority.host_and_port));
+          }
+        }
+      }
+
 
       let mut chunked = false;
       if let Some(v) = parsed_headers.get(&ParsedHeaderName::Ref(&b"Transfer-Encoding"[..])) {
@@ -186,6 +202,7 @@ impl RequestParser {
 
       Some(ParsedRequest {
         request_line,
+        uri,
         headers: parsed_headers,
         header_end: *position,
         connection: Connection::new(),
@@ -200,6 +217,7 @@ impl RequestParser {
 #[derive(Debug,Clone,PartialEq)]
 pub struct ParsedRequest<'a> {
   pub request_line: ParsedRequestLine<'a>,
+  pub uri: HttpUri<'a>,
   pub headers: HashMap<ParsedHeaderName<'a>, ParsedHeaderValue<'a>>,
   pub header_end: usize,
   pub connection: Connection,
@@ -220,7 +238,14 @@ impl<'a> ParsedRequest<'a> {
   }
 
   pub fn host(&'a self) -> Option<&'a[u8]> {
-    self.headers.get(&ParsedHeaderName::Ref(b"Host")).map(|v| v.as_slice())
+    if let Some((_, u)) = super::uri::uri(self.request_line.uri).ok() {
+      println!("host_and_port: {}", from_utf8(u.authority.host_and_port).unwrap());
+      Some(u.authority.host_and_port)
+    } else {
+      let h = self.headers.get(&ParsedHeaderName::Ref(b"Host")).map(|v| v.as_slice());
+      h.as_ref().map(|v| println!("Host header: {}", from_utf8(v).unwrap()));
+      h
+    }
   }
 
   pub fn is_head(&'a self) -> bool {
@@ -250,6 +275,29 @@ pub struct ParsedRequestLine<'a> {
   method: &'a[u8],
   uri: &'a[u8],
   version: Version,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HttpUri<'a> {
+  Origin(&'a[u8]),
+  Absolute(Uri<'a>),
+  // we do not support CONNECT
+  //Authority(Authority<'a>),
+  Asterisk,
+}
+
+impl<'a> HttpUri<'a> {
+  pub fn parse(i: &[u8]) -> Option<HttpUri> {
+    if let Ok((i, origin)) = absolute_path(i) {
+      Some(HttpUri::Origin(origin))
+    } else if let Some(u) = uri(i).ok().map(|(i, u)| u) {
+      Some(HttpUri::Absolute(u))
+    } else if i.len() > 0 && i[0] == b'*' {
+      Some(HttpUri::Asterisk)
+    } else {
+      None
+    }
+  }
 }
 
 #[derive(Debug,Clone,Eq,Ord)]
@@ -375,6 +423,7 @@ impl<'a> Iterator for ValueIterator<'a> {
 
 fn parse_and_validate(input: &[u8]) -> Option<ParsedRequest> {
   let mut state = RequestParser::Initial;
+  println!("{}", from_utf8(input).unwrap());
 
   loop {
     let previous_position = state.position();
@@ -506,6 +555,30 @@ mod tests {
     assert_eq!(res.method(), &b"POST"[..]);
     assert_eq!(res.length, BodyLength::Chunked);
     assert!(res.headers.get(&ParsedHeaderName::Ref(&b"Content-Length"[..])).is_none());
+  }
+
+  #[test]
+  fn get_with_absolute_uri() {
+    let input =
+        b"GET http://lolcatho.st/index.html HTTP/1.1\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input).unwrap();
+    assert_eq!(res.host().unwrap(), &b"lolcatho.st"[..]);
+  }
+
+  #[test]
+  fn get_with_absolute_uri_and_conflicting_host() {
+    let input =
+        b"GET http://lolcatho.st/index.html HTTP/1.1\r\n\
+          Host: example.com\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input).unwrap();
+    assert_eq!(res.host().unwrap(), &b"lolcatho.st"[..]);
+    assert_eq!(res.headers.get(&ParsedHeaderName::Ref(&b"Host"[..])).unwrap().as_slice(), &b"lolcatho.st"[..]);
   }
 }
 
