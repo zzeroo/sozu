@@ -580,5 +580,18 @@ mod tests {
     assert_eq!(res.host().unwrap(), &b"lolcatho.st"[..]);
     assert_eq!(res.headers.get(&ParsedHeaderName::Ref(&b"Host"[..])).unwrap().as_slice(), &b"lolcatho.st"[..]);
   }
+
+  // https://tools.ietf.org/html/rfc7230#section-5.7.1
+  // FIXME: implement Via header
+  /*#[test]
+  fn via_header() {
+    let input =
+        b"GEt / HTTP/1.1\r\n\
+          Transfer-Encoding: gzip, chunked\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input).unwrap();
+    assert_eq!(res.headers.get(&ParsedHeaderName::Ref(&b"Via"[..])).unwrap().as_slice(), &b"1.1 sozu"[..]);
+  }*/
 }
 
