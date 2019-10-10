@@ -2,7 +2,7 @@
 use sozu_command::buffer::Buffer;
 use buffer_queue::BufferQueue;
 
-use nom::{HexDisplay,IResult,Offset,Err, character::complete::char, sequence::tuple};
+use nom::{HexDisplay,IResult,Offset,Err, character::complete::char, sequence::tuple, combinator::opt};
 
 use url::Url;
 
@@ -152,10 +152,36 @@ impl RequestParser {
         parsed_headers.insert(ParsedHeaderName::Ref(name), ParsedHeaderValue { span, value: Cow::from(value) });
       }
 
-      let length = if compare_no_case(request_line.method, &b"HEAD"[..]) {
-        BodyLength::None
+      let mut chunked = false;
+      if let Some(v) = parsed_headers.get(&ParsedHeaderName::Ref(&b"Transfer-Encoding"[..])) {
+
+        //FIXME: we should make sure that chuked is the last in the list
+        for elem in ValueIterator::new(&v.value) {
+          if compare_no_case(elem, &b"chunked"[..]) {
+            chunked = true;
+          }
+        }
+      }
+
+      //FIXME: we should return an error if we could not parse the content-length value
+      let content_length = parsed_headers.get(&ParsedHeaderName::Ref(&b"Content-Length"[..]))
+        .and_then(|v| from_utf8(&v.value).ok()).and_then(|s| s.parse::<usize>().ok());
+
+      let length = if let Some(sz) = content_length {
+        // transfer-encoding overrides content-length and we should remove the contenet-mength header
+        // https://tools.ietf.org/html/rfc7230#section-3.3.3
+        if chunked {
+          parsed_headers.remove(&ParsedHeaderName::Ref(&b"Content-Length"[..]));
+          BodyLength::Chunked
+        } else {
+          BodyLength::Length(sz)
+        }
       } else {
-        BodyLength::None
+        if chunked {
+          BodyLength::Chunked
+        } else {
+          BodyLength::None
+        }
       };
 
       Some(ParsedRequest {
@@ -334,7 +360,7 @@ impl<'a> Iterator for ValueIterator<'a> {
         _ => None,
       }
     } else {
-      match tuple((sp, char(','), sp, single_header_value))(self.data) {
+      match tuple((opt(sp), char(','), opt(sp), single_header_value))(self.data) {
         Ok((i, (_, _, _, value))) => {
           self.data = i;
           Some(value)
@@ -346,7 +372,7 @@ impl<'a> Iterator for ValueIterator<'a> {
   }
 }
 
-fn parse_and_validate(input: &[u8]) -> ParsedRequest {
+fn parse_and_validate(input: &[u8]) -> Option<ParsedRequest> {
   let mut state = RequestParser::Initial;
 
   loop {
@@ -371,14 +397,16 @@ fn parse_and_validate(input: &[u8]) -> ParsedRequest {
     }
   }
 
-  let req = state.validate(&input[..]).unwrap();
+  if let Some(req) = state.validate(&input[..]) {
+    println!("validated request: {:?}", req);
+    for (name, value) in req.headers.iter() {
+      println!("{} -> {}", name, value);
+    }
 
-  println!("validated request: {:?}", req);
-  for (name, value) in req.headers.iter() {
-    println!("{} -> {}", name, value);
+    Some(req)
+  } else {
+    None
   }
-
-  req
 }
 
 #[cfg(test)]
@@ -426,6 +454,46 @@ mod tests {
 
     println!("requesting Host header: {}", req.headers.get(&ParsedHeaderName::Ref(&b"hOsT"[..])).unwrap());
     //panic!();
+  }
+
+  // https://tools.ietf.org/html/rfc7230#section-3.3
+  #[test]
+  fn post_with_transfer_encoding() {
+    let input =
+        b"POST / HTTP/1.1\r\n\
+          Transfer-Encoding: gzip, chunked\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input).unwrap();
+    assert_eq!(res.method(), &b"POST"[..]);
+    assert_eq!(res.length, BodyLength::Chunked);
+  }
+
+  #[test]
+  fn post_with_content_length() {
+    let input =
+        b"POST / HTTP/1.1\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input).unwrap();
+    assert_eq!(res.method(), &b"POST"[..]);
+    assert_eq!(res.length, BodyLength::Length(100));
+  }
+
+  //https://tools.ietf.org/html/rfc7230#section-3.3.3
+  #[test]
+  fn post_with_content_length_and_transfer_encoding() {
+    let input =
+        b"POST / HTTP/1.1\r\n\
+          Content-Length: 100\r\n\
+          Transfer-Encoding: chunked\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input).unwrap();
+    assert_eq!(res.method(), &b"POST"[..]);
+    assert_eq!(res.length, BodyLength::Chunked);
+    assert!(res.headers.get(&ParsedHeaderName::Ref(&b"Content-Length"[..])).is_none());
   }
 }
 

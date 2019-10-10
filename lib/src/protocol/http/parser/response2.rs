@@ -2,7 +2,7 @@
 use sozu_command::buffer::Buffer;
 use buffer_queue::BufferQueue;
 
-use nom::{HexDisplay,IResult,Offset,Err, character::complete::char, sequence::tuple};
+use nom::{HexDisplay,IResult,Offset,Err, character::complete::char, sequence::tuple, combinator::opt};
 
 use url::Url;
 
@@ -134,13 +134,19 @@ impl ResponseParser {
   }
 
 
-  fn validate<'a, 'buffer>(&'a self, buffer: &'buffer[u8]) -> Option<ParsedResponse<'buffer>> {
+  fn validate<'a, 'buffer>(&'a self, buffer: &'buffer[u8], is_request_head: bool) -> Option<ParsedResponse<'buffer>> {
     if let ResponseParser::HeadersParsed(ref position, ref rl, ref headers) = self {
+      let status: u16 = if let Some(s) = from_utf8(rl.status.to_slice()).ok().and_then(|s| s.parse::<u16>().ok()) {
+        s
+      } else {
+        return None;
+      };
+
       let status_line: ParsedStatusLine<'buffer> = ParsedStatusLine {
         span: rl.span.to_slice(),
         version: rl.version,
         reason: rl.reason.to_slice(),
-        status: rl.status.to_slice(),
+        status,
       };
 
       let mut parsed_headers: HashMap<ParsedHeaderName<'buffer>, ParsedHeaderValue<'buffer>> = HashMap::new();
@@ -152,11 +158,55 @@ impl ResponseParser {
         parsed_headers.insert(ParsedHeaderName::Ref(name), ParsedHeaderValue { span, value: Cow::from(value) });
       }
 
+      let mut chunked = false;
+      if let Some(v) = parsed_headers.get(&ParsedHeaderName::Ref(&b"Transfer-Encoding"[..])) {
+
+        if status / 100 == 1 || status == 204 {
+          return None;
+        }
+
+        for elem in ValueIterator::new(&v.value) {
+          println!("testing transfer encoding elem: {}", from_utf8(elem).unwrap());
+          if compare_no_case(elem, &b"chunked"[..]) {
+            println!("is chunked");
+            chunked = true;
+          }
+        }
+
+      }
+
+      let length = if is_request_head {
+        BodyLength::None
+      } else if status / 100 == 1 || status == 204 || status == 304 {
+        BodyLength::None
+      } else {
+        let content_length = parsed_headers.get(&ParsedHeaderName::Ref(&b"Content-Length"[..]))
+          .and_then(|v| from_utf8(&v.value).ok()).and_then(|s| s.parse::<usize>().ok());
+
+        if let Some(sz) = content_length {
+          // transfer-encoding overrides content-length and we should remove the contenet-mength header
+          // https://tools.ietf.org/html/rfc7230#section-3.3.3
+          if chunked {
+            parsed_headers.remove(&ParsedHeaderName::Ref(&b"Content-Length"[..]));
+            BodyLength::Chunked
+          } else {
+            BodyLength::Length(sz)
+          }
+        } else {
+          if chunked {
+            BodyLength::Chunked
+          } else {
+            BodyLength::None
+          }
+        }
+      };
+
       Some(ParsedResponse {
         status_line,
         headers: parsed_headers,
         header_end: *position,
         connection: Connection::new(),
+        length,
       })
     } else {
       None
@@ -170,10 +220,11 @@ pub struct ParsedResponse<'a> {
   pub headers: HashMap<ParsedHeaderName<'a>, ParsedHeaderValue<'a>>,
   pub header_end: usize,
   pub connection: Connection,
+  pub length: BodyLength,
 }
 
 impl<'a> ParsedResponse<'a> {
-  pub fn status(&'a self) -> &'a[u8] {
+  pub fn status(&'a self) -> u16 {
     self.status_line.status
   }
 
@@ -208,7 +259,7 @@ pub enum BodyLength {
 #[derive(Debug,Clone,PartialEq)]
 pub struct ParsedStatusLine<'a> {
   span: &'a[u8],
-  status: &'a[u8],
+  status: u16,
   reason: &'a[u8],
   version: Version,
 }
@@ -322,19 +373,22 @@ impl<'a> Iterator for ValueIterator<'a> {
         _ => None,
       }
     } else {
-      match tuple((sp, char(','), sp, single_header_value))(self.data) {
+      match tuple((opt(sp), char(','), opt(sp), single_header_value))(self.data) {
         Ok((i, (_, _, _, value))) => {
           self.data = i;
           Some(value)
         },
-        _ => None,
+        e => {
+          println!("got error: {:?}", e);
+          None
+        },
 
       }
     }
   }
 }
 
-fn parse_and_validate(input: &[u8]) -> ParsedResponse {
+fn parse_and_validate(input: &[u8], is_request_head: bool) -> Option<ParsedResponse> {
   let mut state = ResponseParser::Initial;
 
   loop {
@@ -359,14 +413,16 @@ fn parse_and_validate(input: &[u8]) -> ParsedResponse {
     }
   }
 
-  let req = state.validate(&input[..]).unwrap();
+  if let Some(req) = state.validate(&input[..], is_request_head) {
+    println!("validated response: {:?}", req);
+    for (name, value) in req.headers.iter() {
+      println!("{} -> {}", name, value);
+    }
 
-  println!("validated request: {:?}", req);
-  for (name, value) in req.headers.iter() {
-    println!("{} -> {}", name, value);
+    Some(req)
+  } else {
+    None
   }
-
-  req
 }
 
 #[cfg(test)]
@@ -403,12 +459,97 @@ mod tests {
       }
     }
 
-    let req = state.validate(&input[..]).unwrap();
+    let req = state.validate(&input[..], false).unwrap();
     println!("validated request: {:?}", req);
     for (name, value) in req.headers.iter() {
       println!("{} -> {}", name, value);
     }
 
     println!("requesting content length header: {}", req.headers.get(&ParsedHeaderName::Ref(&b"Content-LeNGTH"[..])).unwrap());
+  }
+
+  // https://tools.ietf.org/html/rfc7230#section-3.3
+  #[test]
+  fn body_with_head_request() {
+    let input =
+        b"HTTP/1.1 200 OK\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, true).unwrap();
+    assert_eq!(res.length, BodyLength::None);
+  }
+
+  #[test]
+  fn body_with_content_length() {
+    let input =
+        b"HTTP/1.1 200 OK\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.length, BodyLength::Length(100));
+  }
+
+  #[test]
+  fn body_with_transfer_encoding() {
+    let input =
+        b"HTTP/1.1 200 OK\r\n\
+          Transfer-Encoding: gzip, chunked\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.length, BodyLength::Chunked);
+  }
+
+
+  #[test]
+  fn body_with_1xx_status() {
+    let input =
+        b"HTTP/1.1 100 Continue\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.status(), 100);
+    assert_eq!(res.length, BodyLength::None);
+  }
+
+  #[test]
+  fn body_with_204_status() {
+    let input =
+        b"HTTP/1.1 204 No Content\r\n\
+          Content-Length: 0\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.status(), 204);
+    assert_eq!(res.length, BodyLength::None);
+  }
+
+  #[test]
+  fn body_with_304_status() {
+    let input =
+        b"HTTP/1.1 304 Not Modified\r\n\
+          Content-Length: 100\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.status(), 304);
+    assert_eq!(res.length, BodyLength::None);
+  }
+
+  //https://tools.ietf.org/html/rfc7230#section-3.3.3
+  #[test]
+  fn body_with_content_length_and_transfer_encoding() {
+    let input =
+        b"HTTP/1.1 200 OK\r\n\
+          Content-Length: 100\r\n\
+          Transfer-Encoding: chunked\r\n\
+          \r\n";
+
+    let res = parse_and_validate(input, false).unwrap();
+    assert_eq!(res.length, BodyLength::Chunked);
+    assert!(res.headers.get(&ParsedHeaderName::Ref(&b"Content-Length"[..])).is_none());
   }
 }
