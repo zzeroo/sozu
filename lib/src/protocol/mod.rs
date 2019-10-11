@@ -51,6 +51,7 @@ macro_rules! empty (
 );
 
 pub mod http;
+pub mod http_new;
 pub mod pipe;
 #[cfg(feature = "use-openssl")]
 pub mod openssl;

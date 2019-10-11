@@ -24,6 +24,7 @@ use std::collections::HashSet;
 
 mod request;
 mod response;
+mod uri;
 #[cfg(test)]
 mod tests;
 
@@ -863,5 +864,5 @@ pub enum BufferMove {
   /// length
   Delete(usize),
   /// Vec of BufferMove operations
-  Multiple(Vec<BufferMove>),
+  Multiple(Vec<BufferMove>)
 }
