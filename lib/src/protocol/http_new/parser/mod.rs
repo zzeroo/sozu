@@ -22,9 +22,9 @@ use std::str::from_utf8;
 use std::convert::From;
 use std::collections::HashSet;
 
-mod request;
-mod response;
-mod uri;
+pub mod request;
+pub mod response;
+pub mod uri;
 #[cfg(test)]
 mod tests;
 

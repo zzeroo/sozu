@@ -14,7 +14,7 @@ use super::{BufferMove, LengthInformation, RRequestLine, Connection, Chunk, Host
   uri::{Uri, absolute_path, uri}};
 
 #[derive(Debug,Clone,PartialEq,Eq,PartialOrd,Ord)]
-struct BufferSlice {
+pub struct BufferSlice {
   start: usize,
   length: usize,
 }
@@ -33,7 +33,13 @@ impl BufferSlice {
 }
 
 #[derive(Debug,Clone,PartialEq)]
-enum RequestParser {
+pub enum WriteEvent {
+  Slice(BufferSlice),
+  Vec(Vec<u8>),
+}
+
+#[derive(Debug,Clone,PartialEq)]
+pub enum RequestParser {
   Initial,
   /// the usize indicates the current position
   ParsingHeaders(usize, RequestLineParser, BTreeMap<BufferSlice, HeaderValueParser>),
@@ -58,7 +64,7 @@ pub struct HeaderValueParser {
 }
 
 impl RequestParser {
-  fn parse(self: RequestParser, buffer: &[u8]) -> RequestParser {
+  pub fn parse(self: RequestParser, buffer: &[u8]) -> RequestParser {
     match self {
       RequestParser::Initial => match request_line(buffer) {
         Ok((i, r))    => {
@@ -108,7 +114,7 @@ impl RequestParser {
     }
   }
 
-  fn position(&self) -> usize {
+  pub fn position(&self) -> usize {
     match self {
       RequestParser::Initial => 0,
       RequestParser::ParsingHeaders(p, _, _) |
@@ -117,14 +123,14 @@ impl RequestParser {
     }
   }
 
-  fn is_error(&self) -> bool {
+  pub fn is_error(&self) -> bool {
     match self {
       RequestParser::Error(_, _, _) => true,
       _ => false,
     }
   }
 
-  fn is_finished(&self) -> bool {
+  pub fn is_finished(&self) -> bool {
     match self {
       RequestParser::HeadersParsed(_, _, _) |
       RequestParser::Error(_, _, _) => true,
@@ -133,7 +139,7 @@ impl RequestParser {
   }
 
 
-  fn validate<'a, 'buffer>(&'a self, buffer: &'buffer[u8]) -> Option<ParsedRequest<'buffer>> {
+  pub fn validate<'a, 'buffer>(&'a self, buffer: &'buffer[u8]) -> Option<ParsedRequest<'buffer>> {
     if let RequestParser::HeadersParsed(ref position, ref rl, ref headers) = self {
       let request_line: ParsedRequestLine<'buffer> = ParsedRequestLine {
         span: rl.span.to_slice(),
@@ -293,10 +299,10 @@ impl<'a> ParsedRequest<'a> {
   pub fn connection(&'a self) -> &'a Connection {
     &self.connection
   }
-  /*pub fn length_information(&'a self) -> Option<LengthInformation> {
-    LengthInformation::Chunked 
-    LengthInformation::Length(sz)
-  }*/
+
+  pub fn writes(&self) -> Vec<WriteEvent> {
+    unimplemented!()
+  }
 }
 
 #[derive(Debug,Clone,PartialEq)]
