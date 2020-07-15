@@ -4,13 +4,13 @@ use std::net::SocketAddr;
 use std::cell::RefCell;
 use std::rc::Weak;
 use mio::*;
-use mio::tcp::TcpStream;
-use mio::unix::UnixReady;
+use mio::net::TcpStream;
 use uuid::{Uuid, adapter::Hyphenated};
 use {SessionResult,Readiness,SessionMetrics,Protocol};
 use socket::{SocketHandler,SocketResult};
 use pool::{Pool,Checkout};
 use sozu_command::buffer::fixed::Buffer;
+use sozu_command::ready::Ready;
 
 mod parser;
 mod serializer;
@@ -62,8 +62,8 @@ impl<Front:SocketHandler> Http2<Front> {
       state:              Some(state::State::new()),
       request_id,
       back_readiness:    Readiness {
-                            interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
-                            event: UnixReady::from(Ready::empty()),
+                            interest: Ready::readable() | Ready::writable() | Ready::hup() | Ready::error(),
+                            event: Ready::empty(),
       },
       log_ctx,
       public_address,
@@ -85,8 +85,16 @@ impl<Front:SocketHandler> Http2<Front> {
     self.frontend.socket.socket_ref()
   }
 
+  pub fn front_socket_mut(&mut self) -> &mut TcpStream {
+    self.frontend.socket.socket_mut()
+  }
+
   pub fn back_socket(&self)  -> Option<&TcpStream> {
     self.backend.as_ref()
+  }
+
+  pub fn back_socket_mut(&mut self)  -> Option<&mut TcpStream> {
+    self.backend.as_mut()
   }
 
   pub fn set_back_socket(&mut self, socket: TcpStream) {
@@ -408,8 +416,8 @@ impl<Socket:SocketHandler> Connection<Socket> {
     Connection {
       socket,
       readiness: Readiness {
-        interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
-        event: UnixReady::from(Ready::empty()),
+        interest: Ready::readable() | Ready::writable() | Ready::hup() | Ready::error(),
+        event: Ready::empty(),
       },
       //FIXME: capacity can be configured
       read_buffer,

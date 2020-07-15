@@ -1,8 +1,7 @@
 use super::{parser, serializer};
 use nom::Offset;
 use std::collections::{HashMap,VecDeque};
-use mio::Ready;
-use mio::unix::UnixReady;
+use Ready;
 
 use super::stream;
 
@@ -31,7 +30,7 @@ pub enum St {
 pub struct State {
   pub output: VecDeque<OutputFrame>,
   pub state: St,
-  pub interest: UnixReady,
+  pub interest: Ready,
   //FIXME: make it configurable,
   pub max_frame_size: u32,
   pub streams: HashMap<u32, stream::Stream>,
@@ -42,7 +41,7 @@ impl State {
     State {
       output: VecDeque::new(),
       state: St::Init,
-      interest: UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
+      interest: Ready::readable() | Ready::hup() | Ready::error(),
       max_frame_size: 16384,
       streams: HashMap::new(),
     }
@@ -102,7 +101,7 @@ impl State {
 
             self.output.push_back(server_settings);
             self.state = St::ServerPrefaceSent;
-            self.interest.insert(UnixReady::from(Ready::writable()));
+            self.interest.insert(Ready::writable());
             FrameResult::Continue
           },
           f => {

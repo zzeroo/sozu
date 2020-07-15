@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
 use mio::*;
-use mio::tcp::TcpStream;
-use mio::unix::UnixReady;
+use mio::net::*;
 use uuid::adapter::Hyphenated;
 use time::Duration;
 
 use {SessionResult,Readiness,SessionMetrics};
+use sozu_command::ready::Ready;
 use socket::{SocketHandler,SocketResult,TransportProtocol};
 use pool::Checkout;
 use {Protocol, LogDuration};
@@ -75,13 +75,13 @@ impl<Front:SocketHandler> Pipe<Front> {
       backend_id,
       request_id,
       websocket_context,
-      front_readiness:    Readiness {
-                            interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
-                            event: UnixReady::from(Ready::empty()),
+      front_readiness: Readiness {
+          interest: Ready::all(),
+          event: Ready::empty(),
       },
-      back_readiness:    Readiness {
-                            interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
-                            event: UnixReady::from(Ready::empty()),
+      back_readiness: Readiness {
+          interest: Ready::all(),
+          event: Ready::empty(),
       },
       log_ctx,
       session_address,
@@ -106,6 +106,11 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn front_socket(&self) -> &TcpStream {
     self.frontend.socket_ref()
   }
+
+  pub fn front_socket_mut(&mut self) -> &mut TcpStream {
+    self.frontend.socket_mut()
+  }
+
 
   pub fn back_socket(&self)  -> Option<&TcpStream> {
     self.backend.as_ref()

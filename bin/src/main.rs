@@ -4,7 +4,6 @@
 #[macro_use] extern crate structopt_derive;
 #[macro_use] extern crate prettytable;
 extern crate mio;
-extern crate mio_uds;
 extern crate serde;
 extern crate serde_json;
 extern crate time;
