@@ -23,14 +23,14 @@ include = [
 [dependencies]
 hex = "^0.4"
 log = "^0.4"
-pem = "^0.7"
-nix = "^0.15"
+pem = "^0.8"
+nix = "^0.17"
 mio = { version = "^0.7", features = [ "os-poll", "tcp", "uds" ] }
 libc = "^0.2"
 pool = "^0.1"
 time = "^0.2.9"
 toml = "^0.5"
-sha2 = "^0.8"
+sha2 = "^0.9"
 memchr = "2.3"
 regex = "1.1"
 serde = "^1.0.34"
